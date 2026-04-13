@@ -1,0 +1,11 @@
+node_modules/
+main.js
+*.map
+vaso-index.json
+vaso-llm-cache.json
+vaso-debug.log
+data.json
+
+# CI build artifacts
+dist/
+vaso-*.zip

@@ -1,0 +1,68 @@
+default:
+  image: node:20-alpine
+
+stages:
+  - build
+  - package
+
+variables:
+  PACKAGE_NAME: vaso
+
+build:
+  stage: build
+  script:
+    - npm ci
+    - npm run build
+  artifacts:
+    paths:
+      - main.js
+      - manifest.json
+      - styles.css
+    expire_in: 1 hour
+
+package:
+  stage: package
+  needs: [build]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - apk add --no-cache git zip curl
+  script:
+    - |
+      if [ -z "${PROJECT_ACCESS_TOKEN}" ]; then
+        echo "ERROR: PROJECT_ACCESS_TOKEN is not set." >&2
+        echo "Generate a project access token (Settings → Access tokens)" >&2
+        echo "with the write_repository scope, then expose it as a masked" >&2
+        echo "CI/CD variable PROJECT_ACCESS_TOKEN." >&2
+        exit 1
+      fi
+    - VERSION=$(node -p "require('./package.json').version")
+    - echo "Packaging ${PACKAGE_NAME} v${VERSION}"
+
+    - mkdir -p "dist/${PACKAGE_NAME}"
+    - cp main.js manifest.json styles.css "dist/${PACKAGE_NAME}/"
+    - (cd dist && zip -r "../${PACKAGE_NAME}-${VERSION}.zip" "${PACKAGE_NAME}")
+    - cp "${PACKAGE_NAME}-${VERSION}.zip" "${PACKAGE_NAME}-latest.zip"
+
+    - git config user.email "ci@${CI_SERVER_HOST}"
+    - git config user.name "GitLab CI"
+    - git remote set-url origin "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git tag "v${VERSION}"
+    - git push origin "v${VERSION}"
+    - git tag --force latest
+    - git push origin latest --force
+    
+    - |
+      for asset in "${PACKAGE_NAME}-${VERSION}.zip" "${PACKAGE_NAME}-latest.zip"; do
+        echo "Uploading ${asset}"
+        curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+             --upload-file "${asset}" \
+             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/${asset}"
+      done
+
+    - echo "Done. Browse downloads at ${CI_PROJECT_URL}/-/packages"
+  artifacts:
+    name: "${PACKAGE_NAME}-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "${PACKAGE_NAME}-*.zip"
+    expire_in: 90 days
