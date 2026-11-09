@@ -144,6 +144,12 @@ export class VasoContextView extends ItemView {
 
 	// ── Triggers ─────────────────────────────────────────────
 
+	/** The index just became usable: run again (cached answers still apply). */
+	indexReady(): void {
+		this.lastInputKey = "";
+		this.trigger("switch");
+	}
+
 	/** Refresh now, ignoring the response cache (header button, command). */
 	refreshNow(): void {
 		this.trigger("manual");

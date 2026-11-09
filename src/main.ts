@@ -22,6 +22,7 @@ export default class VasoPlugin extends Plugin {
 			flushIntervalMs: 5000,
 		});
 
+		let hadIndex = false;
 		this.store = new IndexStore(
 			this.app,
 			this.manifest.dir ?? "",
@@ -29,6 +30,10 @@ export default class VasoPlugin extends Plugin {
 			() => {
 				this.refreshViews();
 				for (const cb of this.indexListeners) cb();
+				// First usable index (e.g. after the first build): show context without waiting for an edit.
+				const hasIndex = this.store.chunkCount > 0;
+				if (hasIndex && !hadIndex) for (const view of this.views()) view.indexReady();
+				hadIndex = hasIndex;
 			},
 		);
 
@@ -60,6 +65,7 @@ export default class VasoPlugin extends Plugin {
 		});
 
 		await this.store.load();
+		hadIndex = this.store.chunkCount > 0;
 
 		this.app.workspace.onLayoutReady(() => {
 			// Registered here, not earlier: Obsidian fires "create" for every
