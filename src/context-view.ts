@@ -157,6 +157,8 @@ export class VasoContextView extends ItemView {
 
 	private trigger(mode: Trigger): void {
 		if (this.closed) return;
+		// "Update automatically" off: only the refresh button and command run.
+		if (mode !== "manual" && !this.plugin.settings.contextPanelEnabled) return;
 		if (this.busy) {
 			// Let the in-flight response finish (⏹ cancels it), then catch up once.
 			if (this.rerun !== "manual") this.rerun = mode;
@@ -180,7 +182,7 @@ export class VasoContextView extends ItemView {
 	// ── Refresh ──────────────────────────────────────────────
 
 	private async refresh(force: boolean): Promise<void> {
-		if (this.closed || this.busy || !this.plugin.settings.contextPanelEnabled) return;
+		if (this.closed || this.busy) return;
 		const file = this.file;
 		if (!file) {
 			this.setActivity("Open a note to see its lore context.");

@@ -105,8 +105,12 @@ export interface SyncResult {
 const EMBED_BATCH_SIZE = 32;
 
 interface PendingFile {
-	file: TFile;
-	/** mtime captured before reading, so a concurrent edit is re-embedded next time. */
+	/**
+	 * Path and mtime captured before any await: a rename or edit during the
+	 * sync mutates the TFile, and the follow-up update must still see the
+	 * file as changed.
+	 */
+	path: string;
 	mtime: number;
 	chunks: VaultChunk[];
 	vectors: (Vector | null)[];
@@ -195,9 +199,10 @@ export async function syncIndex(
 	// ── Chunk and embed ──
 	const pending: PendingFile[] = [];
 	for (const file of plan.toEmbed) {
+		const path = file.path;
 		const mtime = file.stat.mtime;
-		const chunks = await chunkFile(app, file, settings);
-		pending.push({ file, mtime, chunks, vectors: chunks.map(() => null) });
+		const chunks = await chunkFile(app, file, path, settings);
+		pending.push({ path, mtime, chunks, vectors: chunks.map(() => null) });
 	}
 	const error = ep ? await embedPending(ep, pending, opts.onProgress) : undefined;
 
@@ -220,21 +225,21 @@ export async function syncIndex(
 	for (const pf of pending) {
 		if (!pf.vectors.every((v) => v !== null)) {
 			failedFiles++;
-			const oldMtime = fallback?.mtimes[pf.file.path];
+			const oldMtime = fallback?.mtimes[pf.path];
 			if (fallbackByFile && oldMtime !== undefined) {
-				const old = fallbackByFile.get(pf.file.path) ?? [];
+				const old = fallbackByFile.get(pf.path) ?? [];
 				if (old.length > 0) {
-					byFile.set(pf.file.path, old);
+					byFile.set(pf.path, old);
 					dims = old[0]!.vector.length;
 				}
-				mtimes[pf.file.path] = oldMtime;
+				mtimes[pf.path] = oldMtime;
 			}
 			continue;
 		}
 		const embedded = pf.chunks.map((c, i) => ({ ...c, vector: pf.vectors[i]! }));
 		if (embedded.length > 0) dims = embedded[0]!.vector.length;
-		byFile.set(pf.file.path, embedded);
-		mtimes[pf.file.path] = pf.mtime;
+		byFile.set(pf.path, embedded);
+		mtimes[pf.path] = pf.mtime;
 		embeddedFiles++;
 	}
 
@@ -272,13 +277,14 @@ function groupByFile(chunks: EmbeddedChunk[]): Map<string, EmbeddedChunk[]> {
 }
 
 /** Read, clean and chunk one file. Files with almost no text yield no chunks. */
-async function chunkFile(app: App, file: TFile, settings: VasoSettings): Promise<VaultChunk[]> {
+async function chunkFile(app: App, file: TFile, path: string, settings: VasoSettings): Promise<VaultChunk[]> {
+	const pageName = file.basename;
 	const body = cleanContent(await app.vault.cachedRead(file), settings).trim();
 	if (body.length < 20) return [];
 	return chunkText(body, settings.chunkSize, settings.chunkOverlap).map((text, i) => ({
-		id: `${file.path}#${i}`,
-		filePath: file.path,
-		pageName: file.basename,
+		id: `${path}#${i}`,
+		filePath: path,
+		pageName,
 		text,
 		chunkIndex: i,
 	}));

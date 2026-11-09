@@ -245,7 +245,7 @@ function fromStored(s: StoredIndex): VaultIndex {
 	};
 }
 
-/** Adopt a pre-v2 index, assuming it was built with the current settings and first embedding model. */
+/** Adopt a pre-v2 index: current chunk sizes, the old cleaning rules, the first embedding model. */
 function fromLegacy(raw: LegacyIndex, settings: VasoSettings): VaultIndex {
 	const chunks = (raw.chunks ?? [])
 		.filter((c) => Array.isArray(c.vector) && c.vector.length > 0)
@@ -258,7 +258,9 @@ function fromLegacy(raw: LegacyIndex, settings: VasoSettings): VaultIndex {
 		meta: {
 			embeddingModel: settings.embeddingEndpoints[0]?.model ?? "",
 			dims: chunks[0]?.vector.length ?? 0,
-			configKey: indexConfigKey(settings),
+			// The old indexer always stripped frontmatter and never callouts; a
+			// mismatch with the current settings asks for a rebuild.
+			configKey: indexConfigKey({ ...settings, stripFrontmatter: true, stripCallouts: false }),
 		},
 	};
 }
