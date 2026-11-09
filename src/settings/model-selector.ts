@@ -5,9 +5,6 @@ import type { ModelInfo } from "../llm";
 import { getLogger } from "../logger";
 import type { SettingsContext } from "./shared";
 
-/** Endpoint params that have dedicated UI (skip them when bulk-importing model defaults). */
-const DEDICATED_PARAMS = new Set(["temperature", "num_ctx"]);
-
 /**
  * Render the model picker for an endpoint:
  * - editable text input with datalist autocomplete
@@ -129,38 +126,6 @@ async function loadAndRenderModelInfo(
 	}
 
 	renderModelInfo(container, info);
-
-	if (!opts?.populateParams) return;
-
-	let changed = false;
-
-	if (info.contextLength && !ep.contextSize) {
-		ep.contextSize = info.contextLength;
-		changed = true;
-	}
-
-	const newParams = info.parameters
-		.filter((p) => !DEDICATED_PARAMS.has(p.key))
-		.map((p) => ({ key: `options.${p.key}`, value: p.value }));
-
-	const tempParam = info.parameters.find((p) => p.key === "temperature");
-	if (tempParam && (ep.temperature === undefined || ep.temperature === null)) {
-		const n = parseFloat(tempParam.value);
-		if (!isNaN(n)) {
-			ep.temperature = n;
-			changed = true;
-		}
-	}
-
-	if (newParams.length > 0) {
-		ep.customParams = newParams;
-		changed = true;
-	}
-
-	if (changed) {
-		await ctx.plugin.saveSettings();
-		ctx.refresh();
-	}
 }
 
 function renderModelInfo(container: HTMLElement, info: ModelInfo): void {
@@ -168,24 +133,24 @@ function renderModelInfo(container: HTMLElement, info: ModelInfo): void {
 
 	const badgeRow = container.createDiv("vaso-model-badges");
 
-	if (info.details.family) {
+	if (info.family) {
 		badgeRow.createEl("span", {
 			cls: "vaso-model-badge",
-			text: info.details.family,
+			text: info.family,
 			title: "Model family",
 		});
 	}
-	if (info.details.parameter_size) {
+	if (info.parameterSize) {
 		badgeRow.createEl("span", {
 			cls: "vaso-model-badge",
-			text: info.details.parameter_size,
+			text: info.parameterSize,
 			title: "Parameter count",
 		});
 	}
-	if (info.details.quantization_level) {
+	if (info.quantization) {
 		badgeRow.createEl("span", {
 			cls: "vaso-model-badge vaso-model-badge-dim",
-			text: info.details.quantization_level,
+			text: info.quantization,
 			title: "Quantization level",
 		});
 	}

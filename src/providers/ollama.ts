@@ -1,441 +1,201 @@
 import type { EndpointConfig } from "../types";
 import { getLogger } from "../logger";
-import {
-	parseParamValue,
-	customParamsToObj,
-	buildAuthHeaders,
-	requestUrlJson,
-	fetchStream,
-	logEmbedHttpError,
-} from "./http";
+import { buildHeaders, customParamsOllama, fetchStream, joinUrl, readText, requestJson } from "./http";
 import type {
-	LLMProvider,
 	ChatMessage,
 	ChatStats,
 	ChatStreamResult,
-	StreamCallback,
+	LLMProvider,
 	ModelEntry,
 	ModelInfo,
+	StreamCallback,
 } from "./types";
 
-// ── Request body builder ───────────────────────────────────────
-
-/** Build the request body for an Ollama-native chat call. */
-function buildChatBody(
-	ep: EndpointConfig,
-	messages: ChatMessage[],
-	stream: boolean
-): Record<string, unknown> {
-	const body: Record<string, unknown> = {
-		model: ep.model,
-		messages,
-		stream,
-	};
-
-	if (ep.keepAlive !== undefined && ep.keepAlive !== "") {
-		body.keep_alive = ep.keepAlive;
-	}
-
-	const options: Record<string, unknown> = {};
-
-	if (ep.temperature !== undefined && ep.temperature !== null) {
-		options.temperature = ep.temperature;
-	}
-
-	if (
-		ep.contextSize !== undefined &&
-		ep.contextSize !== null &&
-		ep.contextSize > 0
-	) {
-		options.num_ctx = ep.contextSize;
-	}
-
-	// Merge custom params — keys starting with "options." go into the
-	// options sub-object, everything else goes top-level.
-	for (const p of ep.customParams) {
-		const key = p.key.trim();
-		if (key.length === 0) continue;
-		const val = parseParamValue(p.value);
-		if (key.startsWith("options.")) {
-			options[key.slice(8)] = val;
-		} else {
-			body[key] = val;
-		}
-	}
-
-	if (Object.keys(options).length > 0) {
-		body.options = options;
-	}
-
-	// Thinking / reasoning mode
-	if (ep.thinkingMode === "on") {
-		body.think = true;
-	} else if (ep.thinkingMode === "off") {
-		body.think = false;
-	} else if (
-		ep.thinkingMode === "low" ||
-		ep.thinkingMode === "medium" ||
-		ep.thinkingMode === "high"
-	) {
-		body.think = ep.thinkingMode;
-	}
-
+/** Body fields shared by chat and embed: keep_alive, options (incl. num_ctx) and custom params. */
+function commonBody(ep: EndpointConfig): Record<string, unknown> {
+	const { top, options } = customParamsOllama(ep.customParams);
+	if (ep.contextSize && ep.contextSize > 0) options.num_ctx ??= ep.contextSize;
+	const body: Record<string, unknown> = { ...top };
+	if (ep.keepAlive) body.keep_alive = ep.keepAlive;
+	if (Object.keys(options).length > 0) body.options = options;
 	return body;
 }
 
-// ── Stats parser ───────────────────────────────────────────────
+function buildChatBody(ep: EndpointConfig, messages: ChatMessage[]): Record<string, unknown> {
+	const body = commonBody(ep);
+	if (ep.temperature !== undefined) {
+		body.options = { temperature: ep.temperature, ...(body.options as Record<string, unknown> | undefined) };
+	}
+	if (ep.thinkingMode === "on") body.think = true;
+	else if (ep.thinkingMode === "off") body.think = false;
+	else if (ep.thinkingMode) body.think = ep.thinkingMode;
+	return { ...body, model: ep.model, messages, stream: true };
+}
 
-/** Extract token stats from the final Ollama streaming object. */
 function parseStats(obj: Record<string, unknown>): ChatStats | null {
 	const prompt = obj.prompt_eval_count;
 	const resp = obj.eval_count;
+	if (typeof prompt !== "number" || typeof resp !== "number") return null;
 	const totalNs = obj.total_duration;
-	if (typeof prompt === "number" && typeof resp === "number") {
-		return {
-			promptTokens: prompt,
-			responseTokens: resp,
-			totalDurationMs:
-				typeof totalNs === "number" ? Math.round(totalNs / 1e6) : 0,
-		};
-	}
-	return null;
+	return {
+		promptTokens: prompt,
+		responseTokens: resp,
+		totalDurationMs: typeof totalNs === "number" ? Math.round(totalNs / 1e6) : 0,
+	};
 }
 
-// ── NDJSON stream consumer ────────────────────────────────────
-
+/** NDJSON chat stream: one JSON object per line, the last one has `done: true`. */
 async function consumeOllamaStream(
 	reader: ReadableStreamDefaultReader<Uint8Array>,
 	cb: StreamCallback,
 ): Promise<ChatStreamResult> {
-	const decoder = new TextDecoder();
-	let accumulated = "";
-	let reasoningAccumulated = "";
 	let buffer = "";
+	let text = "";
+	let reasoning = "";
 	let stats: ChatStats | null = null;
-	let seenContent = false;
+	let phase: "none" | "reasoning" | "generating" = "none";
 
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-
-			buffer += decoder.decode(value, { stream: true });
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (trimmed.length === 0) continue;
-				try {
-					const obj = JSON.parse(trimmed) as Record<string, unknown>;
-					const msg = obj.message as Record<string, unknown> | undefined;
-
-					if (msg?.thinking && typeof msg.thinking === "string" && msg.thinking.length > 0) {
-						cb.onStatus("reasoning");
-						reasoningAccumulated += msg.thinking;
-						cb.onReasoning?.(reasoningAccumulated);
-					}
-
-					const token = msg?.content;
-					if (typeof token === "string" && token.length > 0) {
-						if (!seenContent) {
-							cb.onStatus("generating");
-							seenContent = true;
-						}
-						accumulated += token;
-						cb.onChunk(accumulated);
-					}
-
-					if (obj.done) {
-						stats = parseStats(obj);
-						cb.onStatus("done");
-						return { text: accumulated, stats };
-					}
-				} catch {
-					// skip malformed NDJSON lines
-				}
-			}
+	const handleLine = (line: string) => {
+		if (!line.trim()) return;
+		let obj: Record<string, unknown>;
+		try {
+			obj = JSON.parse(line) as Record<string, unknown>;
+		} catch {
+			return;
 		}
+		if (typeof obj.error === "string") throw new Error(obj.error);
+		const msg = obj.message as { thinking?: unknown; content?: unknown } | undefined;
 
-		// Process remaining buffer
-		if (buffer.trim().length > 0) {
-			try {
-				const obj = JSON.parse(buffer.trim()) as Record<string, unknown>;
-				const msg = obj.message as Record<string, unknown> | undefined;
-
-				if (msg?.thinking && typeof msg.thinking === "string" && msg.thinking.length > 0) {
-					cb.onStatus("reasoning");
-					reasoningAccumulated += msg.thinking;
-					cb.onReasoning?.(reasoningAccumulated);
-				}
-				const token = msg?.content;
-				if (typeof token === "string" && token.length > 0) {
-					if (!seenContent) {
-						cb.onStatus("generating");
-						seenContent = true;
-					}
-					accumulated += token;
-					cb.onChunk(accumulated);
-				}
-				if (obj.done) {
-					stats = parseStats(obj);
-				}
-			} catch {
-				// ignore trailing garbage
+		if (typeof msg?.thinking === "string" && msg.thinking) {
+			if (phase === "none") {
+				cb.onStatus("reasoning");
+				phase = "reasoning";
 			}
+			reasoning += msg.thinking;
+			cb.onReasoning?.(reasoning);
 		}
-	} finally {
-		reader.releaseLock();
-	}
+		if (typeof msg?.content === "string" && msg.content) {
+			if (phase !== "generating") {
+				cb.onStatus("generating");
+				phase = "generating";
+			}
+			text += msg.content;
+			cb.onChunk(text);
+		}
+		if (obj.done) stats = parseStats(obj);
+	};
+
+	await readText(reader, (chunk) => {
+		buffer += chunk;
+		const lines = buffer.split("\n");
+		buffer = lines.pop() ?? "";
+		lines.forEach(handleLine);
+	});
+	handleLine(buffer);
 
 	cb.onStatus("done");
-	return { text: accumulated, stats };
+	return { text, stats };
 }
 
-// ── Provider implementation ────────────────────────────────────
-
 export const ollamaProvider: LLMProvider = {
-	// ── Health check ────────────────────────────────────────
-	async healthCheck(ep: EndpointConfig): Promise<void> {
-		const headers = buildAuthHeaders(ep);
-		await requestUrlJson(`${ep.url}/api/tags`, { headers });
+	async healthCheck(ep) {
+		await requestJson(joinUrl(ep.url, "/api/tags"), { headers: buildHeaders(ep) });
 	},
 
-	// ── List models ────────────────────────────────────────
-	async listModels(ep: EndpointConfig): Promise<ModelEntry[]> {
-		const headers = buildAuthHeaders(ep);
-		const data = (await requestUrlJson(`${ep.url}/api/tags`, {
-			headers,
-		})) as { models?: OllamaTagsModel[] };
-
-		const models = data?.models ?? [];
-		return models.map(
-			(m): ModelEntry => ({
-				id: m.model ?? m.name,
-				name: m.name,
-				ownedBy: m.details?.family,
-				parameterSize: m.details?.parameter_size,
-			})
-		);
+	async listModels(ep): Promise<ModelEntry[]> {
+		const data = (await requestJson(joinUrl(ep.url, "/api/tags"), { headers: buildHeaders(ep) })) as {
+			models?: OllamaTagsModel[];
+		};
+		return (data?.models ?? []).map((m) => ({
+			id: m.model ?? m.name,
+			name: m.name,
+			ownedBy: m.details?.family,
+			parameterSize: m.details?.parameter_size,
+		}));
 	},
 
-	// ── Show model ─────────────────────────────────────────
-	async showModel(
-		ep: EndpointConfig,
-		modelName: string
-	): Promise<ModelInfo | null> {
-		const headers = buildAuthHeaders(ep);
-		const data = (await requestUrlJson(`${ep.url}/api/show`, {
+	async showModel(ep, modelName): Promise<ModelInfo | null> {
+		const data = (await requestJson(joinUrl(ep.url, "/api/show"), {
 			method: "POST",
 			body: { model: modelName },
-			headers,
+			headers: buildHeaders(ep),
 		})) as OllamaShowResponse;
 
-		// Parse the "parameters" field: newline-separated "key value" pairs
-		const params: { key: string; value: string }[] = [];
-		if (typeof data.parameters === "string") {
-			for (const line of data.parameters.split("\n")) {
-				const trimmed = line.trim();
-				if (trimmed.length === 0) continue;
-				const spaceIdx = trimmed.indexOf(" ");
-				if (spaceIdx === -1) {
-					params.push({ key: trimmed, value: "" });
-				} else {
-					params.push({
-						key: trimmed.slice(0, spaceIdx).trim(),
-						value: trimmed.slice(spaceIdx + 1).trim(),
-					});
-				}
-			}
+		// "parameters" is newline-separated "key value" pairs.
+		const parameters: ModelInfo["parameters"] = [];
+		for (const line of (data.parameters ?? "").split("\n")) {
+			const t = line.trim();
+			if (!t) continue;
+			const sp = t.search(/\s/);
+			parameters.push(sp === -1 ? { key: t, value: "" } : { key: t.slice(0, sp), value: t.slice(sp).trim() });
 		}
 
-		// Extract context length and parameter count from model_info
 		let contextLength: number | undefined;
-		let parameterCount: number | undefined;
-		const modelInfo = data.model_info as
-			| Record<string, unknown>
-			| undefined;
-		if (modelInfo) {
-			for (const [key, val] of Object.entries(modelInfo)) {
-				if (
-					key.endsWith(".context_length") &&
-					typeof val === "number"
-				) {
-					contextLength = val;
-				}
-				if (
-					key === "general.parameter_count" &&
-					typeof val === "number"
-				) {
-					parameterCount = val;
-				}
-			}
+		for (const [key, val] of Object.entries(data.model_info ?? {})) {
+			if (key.endsWith(".context_length") && typeof val === "number") contextLength = val;
 		}
 
 		return {
-			parameters: params,
-			capabilities: Array.isArray(data.capabilities)
-				? data.capabilities
-				: [],
-			details: data.details ?? {
-				format: "",
-				family: "",
-				parameter_size: "",
-				quantization_level: "",
-			},
+			parameters,
+			capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
 			contextLength,
-			parameterCount,
+			family: data.details?.family,
+			parameterSize: data.details?.parameter_size,
+			quantization: data.details?.quantization_level,
 		};
 	},
 
-	// ── Embed batch ────────────────────────────────────────
-	async embedBatch(
-		ep: EndpointConfig,
-		texts: string[]
-	): Promise<number[][]> {
+	async embedBatch(ep, texts) {
 		if (texts.length === 0) return [];
-
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-
-		const body: Record<string, unknown> = {
-			model: ep.model,
-			input: texts,
-			truncate: true,
-			...customParamsToObj(ep.customParams),
-		};
-		if (ep.keepAlive !== undefined && ep.keepAlive !== "") {
-			body.keep_alive = ep.keepAlive;
-		}
-
-		log.debug(
-			"embed",
-			`Ollama embed: ${texts.length} text(s), model=${ep.model}`
-		);
-
-		let data: { embeddings?: number[][] };
-		try {
-			data = (await requestUrlJson(`${ep.url}/api/embed`, {
-				method: "POST",
-				body,
-				headers,
-			})) as { embeddings?: number[][] };
-		} catch (err) {
-			logEmbedHttpError(log, err);
-			throw err;
-		}
-
+		getLogger().debug("embed", `Ollama embed: ${texts.length} text(s), model=${ep.model}`);
+		const data = (await requestJson(joinUrl(ep.url, "/api/embed"), {
+			method: "POST",
+			body: { truncate: true, ...commonBody(ep), model: ep.model, input: texts },
+			headers: buildHeaders(ep),
+		})) as { embeddings?: number[][] };
 		const vecs = data?.embeddings;
 		if (!Array.isArray(vecs) || vecs.length !== texts.length) {
-			throw new Error("Invalid batch embedding response from Ollama");
+			throw new Error("Invalid embedding response from Ollama");
 		}
 		return vecs;
 	},
 
-	// ── Chat (non-streaming) ───────────────────────────────
-	async chat(ep: EndpointConfig, messages: ChatMessage[]): Promise<string> {
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-		const body = buildChatBody(ep, messages, false);
-
-		log.debug("infer", "Ollama chat request body", body);
-
-		const data = (await requestUrlJson(`${ep.url}/api/chat`, {
-			method: "POST",
-			body,
-			headers,
-		})) as { message?: { content?: string } };
-
-		return data?.message?.content ?? "";
-	},
-
-	// ── Chat (streaming) ───────────────────────────────────
-	async chatStream(
-		ep: EndpointConfig,
-		messages: ChatMessage[],
-		cb: StreamCallback,
-		signal?: AbortSignal
-	): Promise<ChatStreamResult> {
-		signal?.throwIfAborted();
-
-		const log = getLogger();
-		const body = buildChatBody(ep, messages, true);
-		const headers = buildAuthHeaders(ep);
-
-		log.debug(
-			"infer",
-			`Ollama stream: model=${ep.model}, msgs=${messages.length}`
-		);
-
-		const reader = await fetchStream(
-			`${ep.url}/api/chat`,
-			body,
-			headers,
-			signal,
-		);
-
+	async chatStream(ep, messages, cb, signal) {
+		getLogger().debug("infer", `Ollama stream: model=${ep.model}`);
+		const reader = await fetchStream(joinUrl(ep.url, "/api/chat"), buildChatBody(ep, messages), buildHeaders(ep), signal);
 		return consumeOllamaStream(reader, cb);
 	},
 
-	// ── Unload all models ─────────────────────────────────────
-	async unloadAllModels(ep: EndpointConfig): Promise<number | null> {
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-
-		const ps = (await requestUrlJson(`${ep.url}/api/ps`, { headers })) as {
+	async unloadAllModels(ep) {
+		const headers = buildHeaders(ep);
+		const ps = (await requestJson(joinUrl(ep.url, "/api/ps"), { headers })) as {
 			models?: Array<{ model?: string; name?: string }>;
 		};
-		const running = ps?.models ?? [];
-		if (running.length === 0) return 0;
-
-		// Unload each by sending keep_alive: 0
 		let count = 0;
-		for (const m of running) {
+		for (const m of ps?.models ?? []) {
 			const model = m.model ?? m.name;
 			if (!model) continue;
 			try {
-				await requestUrlJson(`${ep.url}/api/generate`, {
-					method: "POST",
-					body: { model, keep_alive: 0 },
-					headers,
-				});
-				log.info("infer", `Ollama: unloaded ${model}`);
+				// keep_alive: 0 unloads immediately.
+				await requestJson(joinUrl(ep.url, "/api/generate"), { method: "POST", body: { model, keep_alive: 0 }, headers });
 				count++;
 			} catch (err) {
-				log.warn("infer", `Ollama: failed to unload ${model}: ${err}`);
+				getLogger().warn("infer", `Ollama: failed to unload ${model}`, err);
 			}
 		}
 		return count;
 	},
 };
 
-// ── Internal response types ────────────────────────────────────
-
-/** Shape of a model entry from GET /api/tags. */
 interface OllamaTagsModel {
 	name: string;
-	model: string;
-	modified_at?: string;
-	size?: number;
-	details?: {
-		format?: string;
-		family?: string;
-		families?: string[];
-		parameter_size?: string;
-		quantization_level?: string;
-	};
+	model?: string;
+	details?: { family?: string; parameter_size?: string };
 }
 
-/** Shape of the POST /api/show response. */
 interface OllamaShowResponse {
 	parameters?: string;
 	model_info?: Record<string, unknown>;
 	capabilities?: string[];
-	details?: {
-		format: string;
-		family: string;
-		families?: string[];
-		parameter_size: string;
-		quantization_level: string;
-	};
+	details?: { family?: string; parameter_size?: string; quantization_level?: string };
 }

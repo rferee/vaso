@@ -1,643 +1,280 @@
 /**
- * LM Studio LLM provider.
+ * LM Studio provider.
  *
- * Supports LM Studio's native `/api/v1/*` endpoints with rich named SSE
- * events (model loading, prompt processing, reasoning, generation), and
- * falls back to the standard OpenAI-compatible `/v1/*` surface for older
- * versions that lack the native API.
- *
- * LM Studio may run on localhost or a remote host (e.g. Tailscale).
- * Streaming uses `fetchStream()` with CORS fallback to `requestUrl`.
+ * Uses the native REST API v1 (LM Studio 0.4+: /api/v1/chat with named SSE
+ * events for model loading, prompt processing, reasoning and output) and
+ * falls back to the OpenAI-compatible /v1/* surface for older servers or when
+ * the native request is rejected.
  */
 
 import type { EndpointConfig } from "../types";
 import { getLogger } from "../logger";
+import { errorMessage } from "../errors";
 import {
-	buildAuthHeaders,
-	customParamsToObj,
-	applyCustomParamsFlat,
-	requestUrlJson,
-	fetchStream,
-	logEmbedHttpError,
-	parseOpenAIEmbeddings,
+	buildHeaders,
 	consumeOpenAIStream,
+	customParamsFlat,
+	fetchStream,
+	joinUrl,
+	readText,
+	requestJson,
 } from "./http";
-import { parseSSE, isSSEDone } from "./parse-sse";
-import type {
-	LLMProvider,
-	ModelEntry,
-	ModelInfo,
-	ChatMessage,
-	ChatStats,
-	ChatStreamResult,
-	StreamCallback,
-} from "./types";
+import { parseSSE } from "./parse-sse";
+import {
+	OPENAI_REASONING_KEYS,
+	listOpenAIModels,
+	openAIChatBody,
+	parseOpenAIEmbeddings,
+} from "./openai-compat";
+import type { ChatMessage, ChatStats, ChatStreamResult, LLMProvider, ModelInfo, StreamCallback } from "./types";
 
-// ── Request body helpers ───────────────────────────────────────
+// ── Native API shapes ─────────────────────────────────────────
 
-/** Build the JSON body for OpenAI-compat `/v1/chat/completions`. */
-function buildOpenAIBody(
-	ep: EndpointConfig,
-	messages: ChatMessage[],
-	stream: boolean,
-): Record<string, unknown> {
-	const body: Record<string, unknown> = {
-		model: ep.model,
-		messages,
-		stream,
+interface LMModel {
+	key?: string;
+	type?: "llm" | "embedding" | string;
+	display_name?: string;
+	publisher?: string;
+	architecture?: string;
+	params_string?: string;
+	quantization?: { name?: string } | null;
+	max_context_length?: number | null;
+	capabilities?: { vision?: boolean; trained_for_tool_use?: boolean; reasoning?: unknown };
+	loaded_instances?: Array<{ id?: string; config?: { context_length?: number } }>;
+}
+
+async function nativeModels(ep: EndpointConfig): Promise<LMModel[]> {
+	const data = (await requestJson(joinUrl(ep.url, "/api/v1/models"), { headers: buildHeaders(ep) })) as {
+		models?: LMModel[];
 	};
-
-	if (ep.temperature !== undefined && ep.temperature !== null) {
-		body.temperature = ep.temperature;
-	}
-
-	if (ep.contextSize && ep.contextSize > 0) {
-		body.context_length = ep.contextSize;
-	}
-
-	if (stream) {
-		body.stream_options = { include_usage: true };
-	}
-
-	applyCustomParamsFlat(body, ep.customParams);
-	return body;
+	return data?.models ?? [];
 }
 
-/**
- * Build the JSON body for LM Studio native `/api/v1/chat`.
- * Uses `input` + `system_prompt` instead of `messages`.
- */
-function buildNativeBody(
-	ep: EndpointConfig,
-	messages: ChatMessage[],
-	stream: boolean,
-): Record<string, unknown> {
-	// Extract system prompt and combine user/assistant turns into input
-	const systemMsg = messages.find((m) => m.role === "system");
-	const nonSystem = messages.filter((m) => m.role !== "system");
-
-	// Build input: for a single user message use a string, otherwise use the array
-	let input: unknown;
-	if (nonSystem.length === 1 && nonSystem[0]!.role === "user") {
-		input = nonSystem[0]!.content;
-	} else {
-		input = nonSystem.map((m) => ({
-			role: m.role,
-			content: m.content,
-		}));
-	}
-
-	const body: Record<string, unknown> = {
-		model: ep.model,
-		input,
-		stream,
-	};
-
-	if (systemMsg) {
-		body.system_prompt = systemMsg.content;
-	}
-
-	if (ep.temperature !== undefined && ep.temperature !== null) {
-		body.temperature = ep.temperature;
-	}
-
-	if (ep.contextSize && ep.contextSize > 0) {
-		body.context_length = ep.contextSize;
-	}
-
-	applyCustomParamsFlat(body, ep.customParams);
-	return body;
+function nativeChatBody(ep: EndpointConfig, messages: ChatMessage[]): Record<string, unknown> {
+	const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+	const input = messages.filter((m) => m.role !== "system").map((m) => m.content).join("\n\n");
+	const body: Record<string, unknown> = { model: ep.model, input, stream: true, store: false };
+	if (system) body.system_prompt = system;
+	// The native API accepts 0..1.
+	if (ep.temperature !== undefined) body.temperature = Math.min(1, Math.max(0, ep.temperature));
+	if (ep.contextSize && ep.contextSize > 0) body.context_length = ep.contextSize;
+	if (ep.thinkingMode) body.reasoning = ep.thinkingMode;
+	return { ...body, ...customParamsFlat(ep.customParams) };
 }
 
-// ── Model loading ─────────────────────────────────────────────
-
-/** Response shape from GET /api/v1/models. */
-interface LMStudioModelsResponse {
-	models?: Array<{
-		id?: string;
-		key?: string;
-		loaded_instances?: Array<{
-			id?: string;
-			config?: { context_length?: number };
-		}>;
-	}>;
-}
-
-/**
- * Check whether `ep.model` is already loaded with the desired context size.
- * Uses `GET /api/v1/models` which exposes `loaded_instances[].config.context_length`.
- * Returns true if the model is loaded with a matching (or larger) context window.
- */
-async function isModelLoadedWithContext(
-	ep: EndpointConfig,
-	headers: Record<string, string>,
-): Promise<boolean> {
-	const log = getLogger();
-	try {
-		log.debug("infer", `LM Studio: checking model status via GET /api/v1/models`);
-		const raw = (await requestUrlJson(`${ep.url}/api/v1/models`, {
-			headers,
-		}));
-		const data = raw as LMStudioModelsResponse;
-
-		const models = data?.models ?? [];
-		log.debug("infer", `LM Studio: /api/v1/models returned ${models.length} model(s)`);
-
-		for (const m of models) {
-			const modelKey = m.key ?? m.id ?? "(unknown)";
-			const instances = m.loaded_instances ?? [];
-			log.debug("infer", `  model="${modelKey}" loaded_instances=${instances.length}`);
-			for (const inst of instances) {
-				const loadedCtx = inst.config?.context_length ?? 0;
-				log.debug("infer", `    instance id="${inst.id}" context_length=${loadedCtx}`);
-			}
-
-			if (m.key !== ep.model && m.id !== ep.model) continue;
-
-			log.debug("infer", `  → matched ep.model="${ep.model}", checking context (want >=${ep.contextSize})`);
-			for (const inst of instances) {
-				const loadedCtx = inst.config?.context_length ?? 0;
-				if (loadedCtx >= (ep.contextSize ?? 0)) {
-					log.debug("infer", `  → already loaded with ctx=${loadedCtx} >= ${ep.contextSize}, skip load`);
-					return true;
-				}
-				log.debug("infer", `  → instance ctx=${loadedCtx} < ${ep.contextSize}, need reload`);
-			}
-			if (instances.length === 0) {
-				log.debug("infer", `  → model found but no loaded instances`);
-			}
-		}
-
-		if (!models.some(m => m.key === ep.model || m.id === ep.model)) {
-			log.debug("infer", `LM Studio: model "${ep.model}" not found in models list (available: ${models.map(m => m.key ?? m.id).join(", ")})`);
-		}
-	} catch (err) {
-		log.warn("infer", `LM Studio: GET /api/v1/models failed, will load to be safe: ${err}`);
-	}
-	return false;
-}
-
-/**
- * Ensure the model is loaded with the configured context size.
- * First checks `GET /api/v1/models` for an existing loaded instance with
- * matching context length. Only calls `POST /api/v1/models/load` when the
- * model isn't already loaded with the right settings.
- */
+/** Load the model with the configured context size unless an instance already has at least that much. */
 async function ensureModelLoaded(ep: EndpointConfig): Promise<void> {
 	if (!ep.contextSize || ep.contextSize <= 0) return;
-
 	const log = getLogger();
-	const headers = buildAuthHeaders(ep);
-
-	if (await isModelLoadedWithContext(ep, headers)) {
-		log.debug("infer", `LM Studio: ${ep.model} already loaded with ctx>=${ep.contextSize}, skipping load`);
-		return;
-	}
-
-	const body: Record<string, unknown> = {
-		model: ep.model,
-		context_length: ep.contextSize,
-	};
-
 	try {
-		log.info("infer", `LM Studio: POSTing /api/v1/models/load model="${ep.model}" context_length=${ep.contextSize}`);
-		const loadResult = await requestUrlJson(`${ep.url}/api/v1/models/load`, {
+		const model = (await nativeModels(ep)).find((m) => m.key === ep.model);
+		if (model?.loaded_instances?.some((i) => (i.config?.context_length ?? 0) >= ep.contextSize!)) return;
+		log.info("infer", `LM Studio: loading ${ep.model} with context_length=${ep.contextSize}`);
+		await requestJson(joinUrl(ep.url, "/api/v1/models/load"), {
 			method: "POST",
-			body,
-			headers,
+			body: { model: ep.model, context_length: ep.contextSize },
+			headers: buildHeaders(ep),
 		});
-		log.info("infer", `LM Studio: load response: ${JSON.stringify(loadResult)}`);
 	} catch (err) {
-		// Older LM Studio versions may not have this endpoint — just continue
-		log.warn("infer", `LM Studio model load request failed (non-fatal): ${err}`);
+		// Older servers lack these endpoints; the chat request loads the model itself.
+		log.warn("infer", "LM Studio: model load check failed (continuing)", err);
 	}
 }
 
-// ── Native streaming (named SSE events) ───────────────────────
-
-/**
- * Stream from LM Studio's native `/api/v1/chat/completions` endpoint,
- * which emits named SSE events for model loading, prompt processing,
- * reasoning, and message generation.
- */
+/** Native /api/v1/chat event stream. Throws when the stream reports an error and produced no text. */
 async function consumeNativeStream(
 	reader: ReadableStreamDefaultReader<Uint8Array>,
 	cb: StreamCallback,
 ): Promise<ChatStreamResult> {
-	const log = getLogger();
-	const decoder = new TextDecoder();
 	let buffer = "";
-	let accumulated = "";
-	let reasoningAccumulated = "";
+	let text = "";
+	let reasoning = "";
 	let stats: ChatStats | null = null;
+	let error: string | null = null;
 
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
+	const handle = (event: string, data: string) => {
+		let d: Record<string, unknown> = {};
+		try {
+			d = data ? (JSON.parse(data) as Record<string, unknown>) : {};
+		} catch {
+			return;
+		}
+		const pct = (p: unknown) => (typeof p === "number" ? ` (${Math.round(p * 100)}%)` : "");
 
-			buffer += decoder.decode(value, { stream: true });
-			const { events, remainder } = parseSSE(buffer);
-			buffer = remainder;
-
-			for (const ev of events) {
-				if (isSSEDone(ev.data)) {
-					log.debug("infer", `LM Studio SSE: [DONE]`);
-					continue;
+		switch (event || d.type) {
+			case "model_load.start":
+				cb.onStatus("loading", "Loading model…");
+				break;
+			case "model_load.progress":
+				cb.onStatus("loading", `Loading model${pct(d.progress)}…`);
+				break;
+			case "prompt_processing.start":
+				cb.onStatus("processing");
+				break;
+			case "prompt_processing.progress":
+				cb.onStatus("processing", `Processing prompt${pct(d.progress)}…`);
+				break;
+			case "reasoning.start":
+				cb.onStatus("reasoning");
+				break;
+			case "reasoning.delta":
+				if (typeof d.content === "string") {
+					reasoning += d.content;
+					cb.onReasoning?.(reasoning);
 				}
-
-				// Log every SSE event for debugging
-				log.debug("infer", `LM Studio SSE event="${ev.event || "(unnamed)"}" data=${ev.data.slice(0, 300)}${ev.data.length > 300 ? "…" : ""}`);
-
-				switch (ev.event) {
-					// ── Model loading ───────────────────────
-					case "model_load.start": {
-						cb.onStatus("loading", "Loading model...");
-						break;
-					}
-					case "model_load.progress": {
-						let detail = "Loading model...";
-						try {
-							const d = JSON.parse(ev.data) as { progress?: number };
-							if (typeof d.progress === "number") {
-								detail = `Loading model (${Math.round(d.progress * 100)}%)`;
-							}
-						} catch { /* ignore */ }
-						cb.onStatus("loading", detail);
-						break;
-					}
-					case "model_load.end": {
-						cb.onStatus("loading", "Model loaded");
-						break;
-					}
-
-					// ── Prompt processing ───────────────────
-					case "prompt_processing.start": {
-						cb.onStatus("processing");
-						break;
-					}
-					case "prompt_processing.end": {
-						break;
-					}
-
-					// ── Reasoning / chain-of-thought ────────
-					case "reasoning.start": {
-						log.info("infer", `LM Studio: reasoning.start`);
-						cb.onStatus("reasoning");
-						break;
-					}
-					case "reasoning.delta": {
-						if (ev.data.length === 0) {
-							log.debug("infer", `LM Studio: reasoning.delta with empty data`);
-							break;
-						}
-						try {
-							const parsed = JSON.parse(ev.data) as Record<string, unknown>;
-							log.debug("infer", `LM Studio reasoning.delta parsed keys: ${Object.keys(parsed).join(", ")}`);
-							// Native API sends content directly, not wrapped in choices/delta
-							let token: string | undefined;
-							if (typeof parsed.content === "string") {
-								token = parsed.content;
-							} else {
-								// Fallback: try OpenAI delta shape
-								const choices = parsed.choices as
-									| Array<{ delta?: { content?: string } }>
-									| undefined;
-								token = choices?.[0]?.delta?.content ?? undefined;
-							}
-							log.debug("infer", `LM Studio reasoning.delta token: ${typeof token === "string" ? `"${token.slice(0, 100)}"` : String(token)}`);
-							if (typeof token === "string" && token.length > 0) {
-								reasoningAccumulated += token;
-								cb.onReasoning?.(reasoningAccumulated);
-							}
-						} catch (err) {
-							log.warn("infer", `LM Studio reasoning.delta parse error: ${err}`);
-						}
-						break;
-					}
-					case "reasoning.end": {
-						log.info("infer", `LM Studio: reasoning.end (accumulated ${reasoningAccumulated.length} chars)`);
-						break;
-					}
-
-					// ── Message content ─────────────────────
-					case "message.start": {
-						cb.onStatus("generating");
-						break;
-					}
-					case "message.delta": {
-						if (ev.data.length === 0) break;
-						try {
-							const parsed = JSON.parse(ev.data) as Record<string, unknown>;
-							// Native API may send content directly or in choices/delta
-							let token: string | undefined;
-							if (typeof parsed.content === "string") {
-								token = parsed.content;
-							} else {
-								const choices = parsed.choices as
-									| Array<{ delta?: { content?: string } }>
-									| undefined;
-								token = choices?.[0]?.delta?.content ?? undefined;
-							}
-							if (typeof token === "string" && token.length > 0) {
-								accumulated += token;
-								cb.onChunk(accumulated);
-							}
-						} catch { /* skip malformed JSON */ }
-						break;
-					}
-					case "message.end": {
-						log.debug("infer", `LM Studio: message.end`);
-						if (ev.data.length > 0) {
-							try {
-								const parsed = JSON.parse(ev.data) as Record<string, unknown>;
-
-								// Extract full text if present
-								const choices = parsed.choices as
-									| Array<{ message?: { content?: string } }>
-									| undefined;
-								const fullText = choices?.[0]?.message?.content;
-								if (typeof fullText === "string" && fullText.length > 0) {
-									accumulated = fullText;
-									cb.onChunk(accumulated);
-								}
-
-								// Extract usage stats
-								const usage = parsed.usage as
-									| { prompt_tokens?: number; completion_tokens?: number }
-									| undefined;
-								if (usage && typeof usage.prompt_tokens === "number") {
-									stats = {
-										promptTokens: usage.prompt_tokens,
-										responseTokens: usage.completion_tokens ?? 0,
-										totalDurationMs: 0,
-									};
-								}
-							} catch { /* skip malformed JSON */ }
-						}
-						cb.onStatus("done");
-						break;
-					}
-
-					default: {
-						log.debug("infer", `LM Studio: unhandled event="${ev.event}"`);
-						// Unknown event — handle as standard OpenAI delta in case
-						// LM Studio mixes in unnamed events.
-						if (ev.event === "" && ev.data.length > 0) {
-							try {
-								const parsed = JSON.parse(ev.data) as Record<string, unknown>;
-								const choices = parsed.choices as
-									| Array<{ delta?: { content?: string } }>
-									| undefined;
-								const token = choices?.[0]?.delta?.content;
-								if (typeof token === "string" && token.length > 0) {
-									accumulated += token;
-									cb.onChunk(accumulated);
-								}
-
-								const usage = parsed.usage as
-									| { prompt_tokens?: number; completion_tokens?: number }
-									| undefined;
-								if (usage && typeof usage.prompt_tokens === "number") {
-									stats = {
-										promptTokens: usage.prompt_tokens,
-										responseTokens: usage.completion_tokens ?? 0,
-										totalDurationMs: 0,
-									};
-								}
-							} catch { /* skip malformed JSON */ }
-						}
-						break;
+				break;
+			case "message.start":
+				cb.onStatus("generating");
+				break;
+			case "message.delta":
+				if (typeof d.content === "string") {
+					text += d.content;
+					cb.onChunk(text);
+				}
+				break;
+			case "error": {
+				const e = d.error as { message?: unknown } | undefined;
+				error = e?.message ? String(e.message) : data;
+				break;
+			}
+			case "chat.end": {
+				const result = d.result as
+					| { stats?: Record<string, unknown>; output?: Array<{ type?: string; content?: unknown }> }
+					| undefined;
+				const s = result?.stats;
+				if (s && typeof s.input_tokens === "number") {
+					stats = {
+						promptTokens: s.input_tokens,
+						responseTokens: typeof s.total_output_tokens === "number" ? s.total_output_tokens : 0,
+						totalDurationMs: 0,
+					};
+				}
+				if (!text) {
+					const out = (result?.output ?? [])
+						.filter((o) => o.type === "message" && typeof o.content === "string")
+						.map((o) => o.content as string)
+						.join("");
+					if (out) {
+						text = out;
+						cb.onChunk(text);
 					}
 				}
+				break;
 			}
 		}
-	} finally {
-		reader.releaseLock();
-	}
+	};
 
-	// If we never received message.done, still mark as done
+	await readText(reader, (chunk) => {
+		buffer += chunk;
+		const { events, remainder } = parseSSE(buffer);
+		buffer = remainder;
+		for (const ev of events) handle(ev.event, ev.data);
+	});
+	for (const ev of parseSSE(buffer + "\n\n").events) handle(ev.event, ev.data);
+
+	if (error && !text) throw new Error(`LM Studio: ${error}`);
 	cb.onStatus("done");
-	return { text: accumulated, stats };
+	return { text, stats };
 }
 
-// ── Provider implementation ────────────────────────────────────
-
 export const lmstudioProvider: LLMProvider = {
-	// ── Health ────────────────────────────────────────────────
-	async healthCheck(ep: EndpointConfig): Promise<void> {
-		const headers = buildAuthHeaders(ep);
-		// GET /api/v1/models — 200 means healthy
-		await requestUrlJson(`${ep.url}/api/v1/models`, { headers });
-	},
-
-	// ── Models ───────────────────────────────────────────────
-	async listModels(ep: EndpointConfig): Promise<ModelEntry[]> {
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-
-		// Try LM Studio's native models endpoint first (richer info).
+	async healthCheck(ep) {
 		try {
-			const data = (await requestUrlJson(
-				`${ep.url}/api/v0/models/list`,
-				{ headers },
-			)) as {
-				data?: Array<{
-					id?: string;
-					object?: string;
-					state?: string;
-					max_context_length?: number;
-					owned_by?: string;
-				}>;
-			};
-
-			const models = data?.data ?? [];
-			return models.map((m) => ({
-				id: m.id ?? "",
-				name: m.id ?? "",
-				ownedBy: m.owned_by,
-				contextLength:
-					typeof m.max_context_length === "number"
-						? m.max_context_length
-						: undefined,
-			}));
-		} catch (err) {
-			log.debug(
-				"infer",
-				`LM Studio native /api/v0/models/list failed, falling back to /v1/models: ${err}`,
-			);
+			await nativeModels(ep);
+		} catch {
+			// Pre-0.4 servers only have the OpenAI-compatible API.
+			await requestJson(joinUrl(ep.url, "/v1/models"), { headers: buildHeaders(ep) });
 		}
-
-		// Fallback to standard OpenAI-compat endpoint.
-		const data = (await requestUrlJson(`${ep.url}/v1/models`, {
-			headers,
-		})) as { data?: Array<{ id?: string; owned_by?: string }> };
-
-		const models = data?.data ?? [];
-		return models.map((m) => ({
-			id: m.id ?? "",
-			name: m.id ?? "",
-			ownedBy: m.owned_by,
-		}));
 	},
 
-	// ── Show (not supported — info is in the models list) ───
-	async showModel(
-		_ep: EndpointConfig,
-		_modelName: string,
-	): Promise<ModelInfo | null> {
-		return null;
+	async listModels(ep) {
+		try {
+			const kind = ep.type === "embedding" ? "embedding" : "llm";
+			return (await nativeModels(ep))
+				.filter((m) => m.key && (!m.type || m.type === kind))
+				.map((m) => ({
+					id: m.key!,
+					name: m.display_name ?? m.key!,
+					ownedBy: m.publisher,
+					contextLength: m.max_context_length ?? undefined,
+					parameterSize: m.params_string,
+					kind: m.type === "embedding" ? ("embedding" as const) : ("llm" as const),
+				}));
+		} catch (err) {
+			getLogger().debug("settings", `LM Studio native model list failed, using /v1/models: ${errorMessage(err)}`);
+			return listOpenAIModels(joinUrl(ep.url, "/v1/models"), ep);
+		}
 	},
 
-	// ── Embed ────────────────────────────────────────────────
-	async embedBatch(
-		ep: EndpointConfig,
-		texts: string[],
-	): Promise<number[][]> {
-		if (texts.length === 0) return [];
-
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-		const body: Record<string, unknown> = {
-			model: ep.model,
-			input: texts,
-			...customParamsToObj(ep.customParams),
+	async showModel(ep, modelName): Promise<ModelInfo | null> {
+		let models: LMModel[];
+		try {
+			models = await nativeModels(ep);
+		} catch {
+			return null;
+		}
+		const m = models.find((x) => x.key === modelName);
+		if (!m) return null;
+		const caps: string[] = [];
+		if (m.capabilities?.reasoning) caps.push("reasoning");
+		if (m.capabilities?.vision) caps.push("vision");
+		if (m.capabilities?.trained_for_tool_use) caps.push("tools");
+		if (m.type === "embedding") caps.push("embedding");
+		return {
+			parameters: [],
+			capabilities: caps,
+			contextLength: m.max_context_length ?? undefined,
+			family: m.architecture,
+			parameterSize: m.params_string,
+			quantization: m.quantization?.name,
 		};
+	},
 
-		log.debug(
-			"embed",
-			`LM Studio embed: model=${ep.model} texts=${texts.length}`,
-		);
-
-		let data: unknown;
-		try {
-			data = await requestUrlJson(`${ep.url}/v1/embeddings`, {
-				method: "POST",
-				body,
-				headers,
-			});
-		} catch (err) {
-			logEmbedHttpError(log, err);
-			throw err;
-		}
-
+	async embedBatch(ep, texts) {
+		if (texts.length === 0) return [];
+		getLogger().debug("embed", `LM Studio embed: ${texts.length} text(s), model=${ep.model}`);
+		const data = await requestJson(joinUrl(ep.url, "/v1/embeddings"), {
+			method: "POST",
+			body: { ...customParamsFlat(ep.customParams), model: ep.model, input: texts },
+			headers: buildHeaders(ep),
+		});
 		return parseOpenAIEmbeddings(data, texts.length, "LM Studio");
 	},
 
-	// ── Chat (non-streaming) ─────────────────────────────────
-	async chat(
-		ep: EndpointConfig,
-		messages: ChatMessage[],
-	): Promise<string> {
+	async chatStream(ep, messages, cb, signal) {
+		const log = getLogger();
+		if (ep.contextSize) cb.onStatus("loading", "Checking model…");
 		await ensureModelLoaded(ep);
 
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-		const body = buildOpenAIBody(ep, messages, false);
-
-		log.debug(
-			"infer",
-			`LM Studio chat: model=${ep.model} msgs=${messages.length}`,
-		);
-
-		const data = (await requestUrlJson(
-			`${ep.url}/v1/chat/completions`,
-			{ method: "POST", body, headers },
-		)) as Record<string, unknown>;
-
-		const choices = data?.choices as
-			| Array<{ message?: { content?: string } }>
-			| undefined;
-		return choices?.[0]?.message?.content ?? "";
-	},
-
-	// ── Chat (streaming) ─────────────────────────────────────
-	async chatStream(
-		ep: EndpointConfig,
-		messages: ChatMessage[],
-		cb: StreamCallback,
-		signal?: AbortSignal,
-	): Promise<ChatStreamResult> {
-		signal?.throwIfAborted();
-
-		if (ep.contextSize && ep.contextSize > 0) {
-			cb.onStatus("loading", "Checking model status…");
-		}
-		await ensureModelLoaded(ep);
-		if (ep.contextSize && ep.contextSize > 0) {
-			cb.onStatus("loading", "Model loaded");
-		}
-
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-
-		log.debug(
-			"infer",
-			`LM Studio chatStream: model=${ep.model} msgs=${messages.length}`,
-		);
-
-		// Try the native endpoint first for rich status events.
 		try {
-			const nativeBody = buildNativeBody(ep, messages, true);
-			log.info("infer", `LM Studio: trying native /api/v1/chat`);
-			const nativeReader = await fetchStream(
-				`${ep.url}/api/v1/chat`,
-				nativeBody,
-				headers,
-				signal,
-			);
-			return await consumeNativeStream(nativeReader, cb);
+			const reader = await fetchStream(joinUrl(ep.url, "/api/v1/chat"), nativeChatBody(ep, messages), buildHeaders(ep), signal);
+			return await consumeNativeStream(reader, cb);
 		} catch (err) {
 			if (signal?.aborted) throw err;
-			log.warn(
-				"infer",
-				`LM Studio native streaming failed, falling back to /v1/: ${err}`,
-			);
+			log.warn("infer", "LM Studio native chat failed, falling back to /v1/chat/completions", err);
 		}
 
-		// Fallback: standard OpenAI-compat streaming via /v1/
-		log.info("infer", `LM Studio: using fallback /v1/chat/completions`);
-		const openaiBody = buildOpenAIBody(ep, messages, true);
-		const stdReader = await fetchStream(
-			`${ep.url}/v1/chat/completions`,
-			openaiBody,
-			headers,
-			signal,
-		);
-		return consumeOpenAIStream(stdReader, cb, {
-			reasoningKeys: ["reasoning_content", "reasoning"],
-			initialProcessing: true,
-		});
+		const body = openAIChatBody(ep, messages);
+		if (ep.contextSize && ep.contextSize > 0) body.context_length ??= ep.contextSize;
+		const reader = await fetchStream(joinUrl(ep.url, "/v1/chat/completions"), body, buildHeaders(ep), signal);
+		return consumeOpenAIStream(reader, cb, { reasoningKeys: OPENAI_REASONING_KEYS, initialProcessing: true });
 	},
 
-	// ── Unload all models ─────────────────────────────────────
-	async unloadAllModels(ep: EndpointConfig): Promise<number | null> {
-		const log = getLogger();
-		const headers = buildAuthHeaders(ep);
-
-		const raw = (await requestUrlJson(`${ep.url}/api/v1/models`, {
-			headers,
-		})) as LMStudioModelsResponse;
-		const models = raw?.models ?? [];
-		const loaded = models.filter(
-			(m) => (m.loaded_instances?.length ?? 0) > 0,
-		);
-		if (loaded.length === 0) return 0;
-
+	async unloadAllModels(ep) {
 		let count = 0;
-		for (const m of loaded) {
-			const model = m.key ?? m.id;
-			if (!model) continue;
-			try {
-				await requestUrlJson(`${ep.url}/api/v1/models/unload`, {
-					method: "POST",
-					body: { instance_id: model },
-					headers,
-				});
-				log.info("infer", `LM Studio: unloaded ${model}`);
-				count++;
-			} catch (err) {
-				log.warn("infer", `LM Studio: failed to unload ${model}: ${err}`);
+		for (const m of await nativeModels(ep)) {
+			for (const inst of m.loaded_instances ?? []) {
+				if (!inst.id) continue;
+				try {
+					await requestJson(joinUrl(ep.url, "/api/v1/models/unload"), {
+						method: "POST",
+						body: { instance_id: inst.id },
+						headers: buildHeaders(ep),
+					});
+					count++;
+				} catch (err) {
+					getLogger().warn("infer", `LM Studio: failed to unload ${inst.id}`, err);
+				}
 			}
 		}
 		return count;

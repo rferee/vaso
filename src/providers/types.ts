@@ -1,26 +1,20 @@
 import type { EndpointConfig } from "../types";
 
-// ── Stream status ───────────────────────────────────────────────
-
-/** Phase of a streaming inference response (drives sidebar status display). */
+/** Phase of a streaming response (drives the panel's status line). */
 export type StreamPhase =
-	| "loading"      // Model being loaded into memory (LM Studio)
-	| "processing"   // Prompt being processed (LM Studio, OpenRouter)
-	| "reasoning"    // Thinking / chain-of-thought (Ollama, OpenRouter, LM Studio)
-	| "generating"   // Content tokens arriving (all providers)
+	| "loading" // model being loaded (LM Studio)
+	| "processing" // prompt being processed (LM Studio, OpenRouter)
+	| "reasoning" // thinking tokens arriving
+	| "generating" // answer tokens arriving
 	| "done";
 
-/** Callback for streaming chat responses. */
 export interface StreamCallback {
-	/** Status phase changed (drives sidebar activity indicator). */
 	onStatus(phase: StreamPhase, detail?: string): void;
-	/** New content arrived — `accumulated` is the full text so far. */
+	/** New answer text; `accumulated` is everything so far. */
 	onChunk(accumulated: string): void;
-	/** Reasoning/thinking token arrived — `accumulated` is the full reasoning so far. */
+	/** New reasoning text; `accumulated` is everything so far. */
 	onReasoning?(accumulated: string): void;
 }
-
-// ── Chat types ──────────────────────────────────────────────────
 
 export interface ChatMessage {
 	role: "system" | "user" | "assistant";
@@ -38,67 +32,46 @@ export interface ChatStreamResult {
 	stats: ChatStats | null;
 }
 
-// ── Model types ─────────────────────────────────────────────────
-
-/** Unified model entry (normalised across all provider APIs). */
+/** Model list entry, normalised across providers. */
 export interface ModelEntry {
-	/** Model identifier (e.g. "qwen3.5:9b", "gpt-4o", "meta-llama/llama-3-8b"). */
 	id: string;
-	/** Human-readable display name. */
 	name: string;
-	/** Provider or owner string (e.g. "library", "openai", "meta-llama"). */
 	ownedBy?: string;
-	/** Max context length in tokens, if known. */
 	contextLength?: number;
-	/** Human-readable parameter size (e.g. "9.2B"). */
 	parameterSize?: string;
+	/** What the model is for, when the provider says. */
+	kind?: "llm" | "embedding";
 }
 
-/** Detailed model info (Ollama /api/show, LM Studio /api/v0/models, etc.). */
+/** Detailed model info (Ollama /api/show, LM Studio /api/v1/models). */
 export interface ModelInfo {
+	/** Model defaults as reported by the server (shown, never sent). */
 	parameters: { key: string; value: string }[];
 	capabilities: string[];
 	contextLength?: number;
-	parameterCount?: number;
-	details: {
-		format: string;
-		family: string;
-		families?: string[];
-		parameter_size: string;
-		quantization_level: string;
-	};
+	family?: string;
+	parameterSize?: string;
+	quantization?: string;
 }
 
-// ── Provider interface ──────────────────────────────────────────
-
 /**
- * Stateless LLM provider — one singleton instance per provider type.
- * Every method receives the EndpointConfig so the provider holds no state.
+ * Stateless provider — one singleton per provider type; every call gets the
+ * endpoint config.
  */
 export interface LLMProvider {
-	/** Check if the endpoint is reachable. Throws on failure. */
+	/** Throws when the endpoint is unreachable or rejects us. */
 	healthCheck(ep: EndpointConfig): Promise<void>;
-
-	/** List available models. */
 	listModels(ep: EndpointConfig): Promise<ModelEntry[]>;
-
-	/** Get detailed model info. Returns null if not supported by this provider. */
+	/** Detailed info, or null when the provider doesn't expose it. */
 	showModel(ep: EndpointConfig, modelName: string): Promise<ModelInfo | null>;
-
-	/** Embed a batch of texts, returning one vector per text. */
+	/** One vector per text, in input order. */
 	embedBatch(ep: EndpointConfig, texts: string[]): Promise<number[][]>;
-
-	/** Non-streaming chat completion. */
-	chat(ep: EndpointConfig, messages: ChatMessage[]): Promise<string>;
-
-	/** Streaming chat completion with status callbacks. */
 	chatStream(
 		ep: EndpointConfig,
 		messages: ChatMessage[],
 		cb: StreamCallback,
-		signal?: AbortSignal
+		signal?: AbortSignal,
 	): Promise<ChatStreamResult>;
-
-	/** Unload all loaded models. Returns the count of models unloaded, or null if not supported. */
-	unloadAllModels?(ep: EndpointConfig): Promise<number | null>;
+	/** Unload every loaded model; returns the count. */
+	unloadAllModels?(ep: EndpointConfig): Promise<number>;
 }
