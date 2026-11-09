@@ -19,7 +19,7 @@ export interface LoggerConfig {
 
 const LOG_FILE = "vaso-debug.log";
 
-/** Truncate a value to a short string for log output. */
+/** Short string for log output. */
 function serialize(v: unknown): string {
 	if (v instanceof Error) return v.message;
 	if (typeof v === "string") return v;
@@ -31,32 +31,39 @@ function serialize(v: unknown): string {
 	}
 }
 
+/**
+ * Warnings and errors always go to the console. Debug and info lines go to the
+ * console and to vaso-debug.log only while debug logging is on, so the default
+ * setup stays quiet.
+ */
 export class DebugLogger {
 	private adapter: DataAdapter;
 	private logPath: string;
 	private config: LoggerConfig;
 	private buffer: string[] = [];
-	private flushTimer: ReturnType<typeof setInterval> | null = null;
+	private flushTimer: number | null = null;
 	private isFlushing = false;
 
 	constructor(adapter: DataAdapter, pluginDir: string, config: LoggerConfig) {
 		this.adapter = adapter;
 		this.logPath = pluginDir ? `${pluginDir}/${LOG_FILE}` : LOG_FILE;
 		this.config = { ...config };
-		if (this.config.enabled) {
-			this.startTimer();
-		}
+		if (this.config.enabled) this.startTimer();
 	}
 
-	// ── Public API ──────────────────────────────────────────
+	get debugEnabled(): boolean {
+		return this.config.enabled;
+	}
 
 	debug(category: LogCategory, message: string, ...data: unknown[]): void {
-		console.log(`[Vaso] ${message}`, ...data);
+		if (!this.config.enabled) return;
+		console.debug(`[Vaso] ${message}`, ...data);
 		this.pushLine("DEBUG", category, message, data);
 	}
 
 	info(category: LogCategory, message: string, ...data: unknown[]): void {
-		console.log(`[Vaso] ${message}`, ...data);
+		if (!this.config.enabled) return;
+		console.info(`[Vaso] ${message}`, ...data);
 		this.pushLine("INFO", category, message, data);
 	}
 
@@ -77,6 +84,7 @@ export class DebugLogger {
 			this.startTimer();
 		} else if (!this.config.enabled && wasEnabled) {
 			this.stopTimer();
+			void this.flush();
 		}
 	}
 
@@ -87,17 +95,16 @@ export class DebugLogger {
 			const chunk = this.buffer.join("\n") + "\n";
 			this.buffer.length = 0;
 
-			// Rotate if over size limit
+			// Rotate by deletion once over the size limit.
 			try {
 				const stat = await this.adapter.stat(this.logPath);
 				if (stat && stat.size >= this.config.maxFileSizeBytes) {
 					await this.adapter.remove(this.logPath);
 				}
-			} catch { /* file may not exist yet — fine */ }
+			} catch { /* file may not exist yet */ }
 
 			await this.adapter.append(this.logPath, chunk);
 		} catch (err) {
-			// Never break the plugin — log to console as last resort
 			console.warn("[Vaso] Log flush failed:", err);
 		} finally {
 			this.isFlushing = false;
@@ -109,28 +116,21 @@ export class DebugLogger {
 		await this.flush();
 	}
 
-	// ── Internals ───────────────────────────────────────────
-
 	private pushLine(level: string, category: LogCategory, message: string, data: unknown[]): void {
 		if (!this.config.enabled) return;
-		const ts = new Date().toISOString();
-		let line = `[${ts}] [${level}] [${category}] ${message}`;
-		if (data.length > 0) {
-			line += " " + data.map(serialize).join(" ");
-		}
+		let line = `[${new Date().toISOString()}] [${level}] [${category}] ${message}`;
+		if (data.length > 0) line += " " + data.map(serialize).join(" ");
 		this.buffer.push(line);
 	}
 
 	private startTimer(): void {
-		if (this.flushTimer) return;
-		this.flushTimer = setInterval(() => {
-			this.flush();
-		}, this.config.flushIntervalMs);
+		if (this.flushTimer !== null) return;
+		this.flushTimer = window.setInterval(() => void this.flush(), this.config.flushIntervalMs);
 	}
 
 	private stopTimer(): void {
-		if (this.flushTimer) {
-			clearInterval(this.flushTimer);
+		if (this.flushTimer !== null) {
+			window.clearInterval(this.flushTimer);
 			this.flushTimer = null;
 		}
 	}
@@ -138,8 +138,10 @@ export class DebugLogger {
 
 // ── Singleton ───────────────────────────────────────────────────
 
-/** Surface used by the rest of the plugin — DebugLogger and the console fallback both implement this. */
-export type Logger = Pick<DebugLogger, "debug" | "info" | "warn" | "error" | "updateConfig" | "flush" | "destroy">;
+export type Logger = Pick<
+	DebugLogger,
+	"debug" | "info" | "warn" | "error" | "updateConfig" | "flush" | "destroy" | "debugEnabled"
+>;
 
 let instance: DebugLogger | null = null;
 
@@ -148,17 +150,25 @@ export function initLogger(adapter: DataAdapter, pluginDir: string, config: Logg
 	return instance;
 }
 
-/** Console-only fallback used before initLogger() runs (or after destroy). */
+/** Used before initLogger() runs and after the plugin unloads: warnings and errors only. */
 const consoleFallback: Logger = {
-	debug: (_c, m, ...d) => console.log(`[Vaso] ${m}`, ...d),
-	info:  (_c, m, ...d) => console.log(`[Vaso] ${m}`, ...d),
-	warn:  (_c, m, ...d) => console.warn(`[Vaso] ${m}`, ...d),
+	debugEnabled: false,
+	debug: () => undefined,
+	info: () => undefined,
+	warn: (_c, m, ...d) => console.warn(`[Vaso] ${m}`, ...d),
 	error: (_c, m, ...d) => console.error(`[Vaso] ${m}`, ...d),
-	updateConfig: () => { /* no-op */ },
+	updateConfig: () => undefined,
 	flush: () => Promise.resolve(),
 	destroy: () => Promise.resolve(),
 };
 
 export function getLogger(): Logger {
 	return instance ?? consoleFallback;
+}
+
+/** Drop the singleton (plugin unload). */
+export async function destroyLogger(): Promise<void> {
+	const current = instance;
+	instance = null;
+	await current?.destroy();
 }

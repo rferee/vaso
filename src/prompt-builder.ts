@@ -2,183 +2,130 @@ import { TFile } from "obsidian";
 import type { App } from "obsidian";
 import type { SearchResult, EmbeddedChunk, VasoSettings } from "./types";
 import type { ChatMessage } from "./llm";
-import { stripFrontmatter } from "./indexer";
-
-// ── Helpers ──────────────────────────────────────────────────────
-
-/**
- * Strip Obsidian callout blocks from text, preserving whitelisted types.
- */
-function stripCalloutBlocks(text: string, whitelist: string[]): string {
-	const wl = new Set(whitelist.map((w) => w.toLowerCase()));
-	const lines = text.split("\n");
-	const result: string[] = [];
-	let i = 0;
-
-	while (i < lines.length) {
-		const line = lines[i]!;
-		const match = line.match(/^>\s*\[!(\w+)\]/);
-		if (match) {
-			const calloutType = match[1]!.toLowerCase();
-			const blockLines: string[] = [line];
-			let j = i + 1;
-			while (j < lines.length && /^>/.test(lines[j]!)) {
-				blockLines.push(lines[j]!);
-				j++;
-			}
-			if (wl.has(calloutType)) {
-				result.push(...blockLines);
-			}
-			i = j;
-		} else {
-			result.push(line);
-			i++;
-		}
-	}
-
-	return result.join("\n");
-}
-
-/** Clean content for LLM: strip frontmatter and callouts per settings. */
-export function cleanContent(
-	text: string,
-	settings: Pick<VasoSettings, "stripFrontmatter" | "stripCallouts" | "calloutWhitelist">
-): string {
-	let out = text;
-	if (settings.stripFrontmatter) {
-		out = stripFrontmatter(out);
-	}
-	if (settings.stripCallouts) {
-		out = stripCalloutBlocks(out, settings.calloutWhitelist);
-	}
-	return out;
-}
+import { cleanContent, hashString, truncateWords } from "./text";
 
 // ── Context builders ─────────────────────────────────────────────
 
-/** Build context from chunk text only. */
+type PageSettings = Pick<
+	VasoSettings,
+	"l1MaxPageWords" | "stripFrontmatter" | "stripCallouts" | "calloutWhitelist"
+>;
+
+/** Matched chunk text only (L2, and L0 at chunk depth). */
 export function buildChunkContext(results: SearchResult[]): string {
-	const parts: string[] = [];
-	for (const r of results) {
-		parts.push(`**[[${r.chunk.pageName}]]:**\n${r.chunk.text}`);
-	}
-	return parts.join("\n\n");
+	return results.map((r) => `**[[${r.chunk.pageName}]]:**\n${r.chunk.text}`).join("\n\n");
 }
 
-/** Build context from full source pages (L1). */
+/** Full source pages, cleaned and truncated (L1, and L0 at page depth). */
 export async function buildFullPageContext(
 	results: SearchResult[],
 	app: App,
-	settings: Pick<VasoSettings, "l1MaxPageWords" | "stripFrontmatter" | "stripCallouts" | "calloutWhitelist">
+	settings: PageSettings,
 ): Promise<string> {
 	const parts: string[] = [];
-	const maxWords = settings.l1MaxPageWords;
-
 	for (const r of results) {
 		const file = app.vault.getAbstractFileByPath(r.chunk.filePath);
-		if (!file || !(file instanceof TFile)) continue;
-
-		let content = await app.vault.cachedRead(file);
-		content = cleanContent(content, settings);
-
-		const words = content.split(/\s+/);
-		if (words.length > maxWords) {
-			content = words.slice(0, maxWords).join(" ") + "\n[…truncated]";
-		}
-
-		parts.push(`### [[${r.chunk.pageName}]]\n${content}`);
+		if (!(file instanceof TFile)) continue;
+		const content = cleanContent(await app.vault.cachedRead(file), settings);
+		parts.push(`### [[${r.chunk.pageName}]]\n${truncateWords(content, settings.l1MaxPageWords)}`);
 	}
-
 	return parts.join("\n\n---\n\n");
 }
 
-/**
- * Build L0 context according to l0Depth setting.
- * - "chunk": matched chunk text only
- * - "nearby": matched chunk ± l0NearbyRadius surrounding chunks
- * - "page": full source page
- */
+/** L0 context at the configured depth: chunk, chunk ± radius, or full page. */
 export async function buildL0Context(
 	results: SearchResult[],
 	app: App,
-	settings: Pick<VasoSettings, "l0Depth" | "l0NearbyRadius" | "l1MaxPageWords" | "stripFrontmatter" | "stripCallouts" | "calloutWhitelist">,
-	indexChunks: EmbeddedChunk[]
+	settings: PageSettings & Pick<VasoSettings, "l0Depth" | "l0NearbyRadius">,
+	indexChunks: EmbeddedChunk[],
 ): Promise<string> {
-	const depth = settings.l0Depth;
+	if (settings.l0Depth === "page") return buildFullPageContext(results, app, settings);
+	if (settings.l0Depth === "chunk") return buildChunkContext(results);
 
-	if (depth === "page") {
-		return buildFullPageContext(results, app, settings);
+	const radius = settings.l0NearbyRadius;
+	const wanted = new Set(results.map((r) => r.chunk.filePath));
+	const siblings = new Map<string, EmbeddedChunk[]>();
+	for (const c of indexChunks) {
+		if (!wanted.has(c.filePath)) continue;
+		const arr = siblings.get(c.filePath);
+		if (arr) arr.push(c);
+		else siblings.set(c.filePath, [c]);
 	}
 
-	if (depth === "nearby") {
-		const radius = settings.l0NearbyRadius;
-		const parts: string[] = [];
-
-		for (const r of results) {
-			const siblings = indexChunks
-				.filter((c) => c.filePath === r.chunk.filePath)
-				.sort((a, b) => a.chunkIndex - b.chunkIndex);
-
-			const minIdx = Math.max(0, r.chunk.chunkIndex - radius);
-			const maxIdx = r.chunk.chunkIndex + radius;
-
-			const nearby = siblings
-				.filter((c) => c.chunkIndex >= minIdx && c.chunkIndex <= maxIdx)
+	return results
+		.map((r) => {
+			const lo = r.chunk.chunkIndex - radius;
+			const hi = r.chunk.chunkIndex + radius;
+			const nearby = (siblings.get(r.chunk.filePath) ?? [])
+				.filter((c) => c.chunkIndex >= lo && c.chunkIndex <= hi)
+				.sort((a, b) => a.chunkIndex - b.chunkIndex)
 				.map((c) => c.text);
+			return `**[[${r.chunk.pageName}]]:**\n${nearby.join("\n\n")}`;
+		})
+		.join("\n\n");
+}
 
-			parts.push(`**[[${r.chunk.pageName}]]:**\n${nearby.join("\n\n")}`);
-		}
+// ── Template ─────────────────────────────────────────────────────
 
-		return parts.join("\n\n");
-	}
+export interface PromptVars {
+	/** Title of the note being written. */
+	title: string;
+	/** Paragraph under the cursor (empty when there's no editor). */
+	paragraph: string;
+	/** Tail of the current note. */
+	writing: string;
+	l0: string;
+	l1: string;
+	l2: string;
+}
 
-	return buildChunkContext(results);
+export const TEMPLATE_VARIABLES: Record<keyof PromptVars, string> = {
+	title: "Title of the note you're writing",
+	paragraph: "Paragraph under the cursor",
+	writing: "The current note (last N words, per Writing context)",
+	l0: "Lore matched to the cursor paragraph",
+	l1: "Full lore pages matched to the whole note",
+	l2: "Extra lore excerpts",
+};
+
+/**
+ * Render a user-prompt template.
+ *
+ * `{{name}}` inserts a variable. `{{#name}}…{{/name}}` keeps its contents only
+ * when the variable is non-empty. Runs of blank lines left behind by empty
+ * sections collapse to one; inserted text is never re-scanned or altered.
+ */
+export function renderTemplate(template: string, vars: PromptVars): string {
+	const value = (name: string) =>
+		Object.prototype.hasOwnProperty.call(vars, name) ? vars[name as keyof PromptVars] : undefined;
+
+	const withSections = template.replace(
+		/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
+		(_m, name: string, inner: string) => (value(name)?.trim() ? inner : ""),
+	);
+	const tidy = withSections.replace(/\n[ \t]*(?:\n[ \t]*)+\n/g, "\n\n").trim();
+	return tidy.replace(/\{\{(\w+)\}\}/g, (m, name: string) => value(name) ?? m);
+}
+
+export function buildMessages(systemPrompt: string, template: string, vars: PromptVars): ChatMessage[] {
+	return [
+		{ role: "system", content: systemPrompt },
+		{ role: "user", content: renderTemplate(template, vars) },
+	];
 }
 
 // ── Cache key ────────────────────────────────────────────────────
 
-/** Build a deterministic cache key from the search results. */
-export function buildCacheKey(l0: SearchResult[], l1: SearchResult[], l2: SearchResult[]): string {
-	const ids = [
-		...l0.map((r) => `0:${r.chunk.id}`),
-		...l1.map((r) => `1:${r.chunk.id}`),
-		...l2.map((r) => `2:${r.chunk.id}`),
-	];
-	ids.sort();
-	return ids.join("|");
-}
-
-// ── Prompt assembly ──────────────────────────────────────────────
-
-/** Assemble the LLM messages from search results and writing context. */
-export function buildMessages(
-	systemPrompt: string,
-	writingContext: string,
-	cursorParagraph: string | null,
-	l0Context: string,
-	l1Context: string,
-	l2Context: string
-): ChatMessage[] {
-	let userContent = "";
-
-	if (cursorParagraph) {
-		userContent += `## Paragraph the user is currently editing:\n**${cursorParagraph}**\n\n`;
-	}
-
-	userContent += `## Writing context:\n${writingContext}\n\n`;
-
-	if (l0Context.length > 0) {
-		userContent += `## Most relevant lore (paragraph-matched):\n${l0Context}\n\n`;
-	}
-	if (l1Context.length > 0) {
-		userContent += `## Lore pages (note-matched):\n${l1Context}\n\n`;
-	}
-	if (l2Context.length > 0) {
-		userContent += `## Additional lore excerpts:\n${l2Context}`;
-	}
-
-	return [
-		{ role: "system" as const, content: systemPrompt },
-		{ role: "user" as const, content: userContent },
-	];
+/**
+ * Cache key for a synthesis. It covers the prompts and the retrieved lore
+ * text (so edited sources or prompts invalidate it), but not the note being
+ * written: reopening a note replays the last answer while its sources match.
+ */
+export function buildCacheKey(
+	settings: Pick<VasoSettings, "systemPrompt" | "userPromptTemplate">,
+	vars: Pick<PromptVars, "l0" | "l1" | "l2">,
+): string {
+	return hashString(
+		[settings.systemPrompt, settings.userPromptTemplate, vars.l0, vars.l1, vars.l2].join("\u0000"),
+	);
 }

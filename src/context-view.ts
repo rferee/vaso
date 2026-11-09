@@ -1,545 +1,578 @@
-import { ItemView, WorkspaceLeaf, TFile, MarkdownRenderer } from "obsidian";
+import {
+	Component,
+	ItemView,
+	MarkdownRenderer,
+	MarkdownView,
+	Notice,
+	TFile,
+	setIcon,
+	setTooltip,
+} from "obsidian";
+import type { Editor, WorkspaceLeaf } from "obsidian";
 import type VasoPlugin from "./main";
 import type { SearchResult } from "./types";
-import { chatStreamWithStatus, providerLabel } from "./llm";
-import type { ChatStats, StreamPhase } from "./llm";
+import { PROVIDER_LABELS } from "./types";
+import { chatStreamWithStatus } from "./llm";
+import type { StreamPhase } from "./llm";
 import { LLMCache } from "./llm-cache";
 import { ContextPipeline } from "./context-pipeline";
 import type { PipelineRun } from "./context-pipeline";
+import type { ThreeLayerResult } from "./search";
+import { hasIndexScope, indexMismatch } from "./indexer";
+import { errorMessage, isAbortError } from "./errors";
 import { getLogger } from "./logger";
 
 export const CONTEXT_VIEW_TYPE = "vaso-context";
 
+type Trigger = "edit" | "switch" | "manual";
+
+/** Streaming re-renders are throttled; full Markdown renders per token are slow on phones. */
+const STREAM_RENDER_MS = 120;
+
+const LAYER_INFO = {
+	l0: { label: "L0", title: "Matched to the paragraph you're editing" },
+	l1: { label: "L1", title: "Matched to the whole note (full page sent)" },
+	l2: { label: "L2", title: "Broad context (excerpt sent)" },
+} as const;
+
 export class VasoContextView extends ItemView {
 	plugin: VasoPlugin;
-	private contentEl_: HTMLElement | null = null;
-	private statusBarEl: HTMLElement | null = null;
-	private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-	private lastQueryText = "";
+
+	private statusEl!: HTMLElement;
+	private bodyEl!: HTMLElement;
+	private refreshBtn!: HTMLElement;
+	private stopBtn!: HTMLElement;
+
+	private llmCache: LLMCache;
+	private pipeline: ContextPipeline;
+
+	/** The note the panel follows. Kept when focus moves to the panel itself. */
+	private file: TFile | null = null;
+	private lastInputKey = "";
+	private debounceTimer: number | null = null;
 	private abortController: AbortController | null = null;
-
-	/** Header buttons — references kept so we can toggle their enabled state. */
-	private refreshBtn: HTMLElement | null = null;
-	private stopBtn: HTMLElement | null = null;
-	/**
-	 * Lock — when true, a refresh (embedding + search + LLM stream) is in
-	 * progress. New triggers are skipped until the current one finishes or is
-	 * stopped. Lets a slow response complete instead of being cancelled and
-	 * restarted on every keystroke.
-	 */
+	/** A refresh is running; new triggers wait for it instead of cancelling it. */
 	private busy = false;
+	/** A trigger arrived while busy: run once more afterwards. */
+	private rerun: Trigger | null = null;
 
-	/** LLM response cache (persisted to disk). */
-	private llmCache: LLMCache | null = null;
-	/** Wraps embedding/search/context-build off the view. */
-	private pipeline: ContextPipeline | null = null;
+	/** Raw Markdown of the answer on screen (for Copy). */
+	private answerText = "";
+	private tokensText = "—";
+	private activityText = "—";
 
-	/** Last LLM token usage stats (displayed in status bar). */
-	private lastStats: ChatStats | null = null;
-	/** Last TPS measurement (displayed in status bar). */
-	private lastTps: string | null = null;
-	/** Last activity text (persisted across status bar re-renders). */
-	private lastActivity = "—";
+	/** Bumped per synthesis layout and per slot render, so late async renders are dropped. */
+	private renderSeq = 0;
+	private slotSeq = new Map<string, number>();
+	private markdownParts = new Map<string, Component>();
+	private streamTimer: number | null = null;
+	private streamPending: { answer?: string; reasoning?: string } = {};
 
 	constructor(leaf: WorkspaceLeaf, plugin: VasoPlugin) {
 		super(leaf);
 		this.plugin = plugin;
+		this.llmCache = new LLMCache(this.app.vault.adapter, plugin.manifest.dir ?? "");
+		this.pipeline = new ContextPipeline(this.app, this.llmCache, () => this.plugin.settings);
 	}
 
-	getViewType(): string { return CONTEXT_VIEW_TYPE; }
-	getDisplayText(): string { return "Vaso"; }
-	getIcon(): string { return "book-open"; }
+	getViewType(): string {
+		return CONTEXT_VIEW_TYPE;
+	}
+	getDisplayText(): string {
+		return "Vaso";
+	}
+	getIcon(): string {
+		return "book-open";
+	}
 
 	async onOpen(): Promise<void> {
-		const container = this.containerEl.children[1] as HTMLElement;
-		if (!container) return;
-		container.empty();
-		container.addClass("vaso-container");
+		const root = this.contentEl;
+		root.empty();
+		root.addClass("vaso-container");
 
-		const header = container.createDiv("vaso-header");
-		header.createEl("h4", { text: "Vaso" });
+		const header = root.createDiv("vaso-header");
+		header.createDiv({ cls: "vaso-title", text: "Lore context" });
+		const actions = header.createDiv("vaso-header-actions");
+		this.refreshBtn = this.iconButton(actions, "refresh-cw", "Refresh context", () => this.refreshNow());
+		this.stopBtn = this.iconButton(actions, "square", "Stop the response", () => this.stopInFlight());
 
-		const headerBtns = header.createDiv("vaso-header-btns");
-		this.refreshBtn = headerBtns.createEl("span", {
-			cls: "vaso-header-btn",
-			text: "↻",
-			title: "Refresh context",
-		});
-		this.refreshBtn.addEventListener("click", () => this.triggerRefresh("manual"));
+		this.statusEl = root.createDiv("vaso-status");
+		this.bodyEl = root.createDiv("vaso-body");
+		this.bodyEl.createDiv({ cls: "vaso-placeholder", text: "Start writing to see relevant lore." });
 
-		this.stopBtn = headerBtns.createEl("span", {
-			cls: "vaso-header-btn vaso-header-btn-stop",
-			text: "⏹",
-			title: "Stop the in-flight LLM response",
-		});
-		this.stopBtn.addEventListener("click", () => this.stopInFlight());
-		this.updateActionButtons();
-
-		this.statusBarEl = container.createDiv("vaso-statusbar");
-		this.renderStatusBar();
-
-		this.contentEl_ = container.createDiv("vaso-content");
-		this.contentEl_.createEl("p", {
-			cls: "vaso-placeholder",
-			text: "Start writing to see relevant lore…",
+		// Internal links in rendered answers should navigate like in a note.
+		this.bodyEl.on("click", "a.internal-link", (evt, a) => {
+			evt.preventDefault();
+			const target = a.getAttr("data-href") ?? a.getText();
+			void this.app.workspace.openLinkText(target, this.file?.path ?? "", evt.ctrlKey || evt.metaKey);
 		});
 
-		this.llmCache = new LLMCache(this.app.vault.adapter, this.plugin.manifest.dir ?? "");
 		await this.llmCache.load();
-		this.pipeline = new ContextPipeline(
-			this.app,
-			this.llmCache,
-			() => this.plugin.settings,
-		);
 
 		this.registerEvent(
-			this.app.workspace.on("active-leaf-change", () => {
-				this.lastQueryText = "";
-				this.triggerRefresh("switch");
-			})
+			this.app.workspace.on("active-leaf-change", (leaf) => {
+				const view = leaf?.view;
+				if (view instanceof MarkdownView && view.file && view.file !== this.file) {
+					this.file = view.file;
+					this.lastInputKey = "";
+					this.trigger("switch");
+				}
+			}),
 		);
 		this.registerEvent(
-			this.app.workspace.on("editor-change", () => {
-				this.triggerRefresh("edit");
-			})
+			this.app.workspace.on("editor-change", (_editor, info) => {
+				if (info.file) this.file = info.file;
+				this.trigger("edit");
+			}),
 		);
+
+		this.file = this.app.workspace.getActiveViewOfType(MarkdownView)?.file ?? this.app.workspace.getActiveFile();
+		this.updateButtons();
+		this.renderStatus();
+		if (this.file) this.trigger("switch");
 	}
 
 	async onClose(): Promise<void> {
-		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
+		if (this.streamTimer !== null) window.clearTimeout(this.streamTimer);
 		this.abortController?.abort();
-		await this.llmCache?.save();
+		await this.llmCache.save();
 	}
 
-	// ── Refresh triggers ─────────────────────────────────────
+	// ── Triggers ─────────────────────────────────────────────
 
-	private triggerRefresh(mode: "edit" | "switch" | "manual") {
-		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+	/** Refresh now, ignoring the response cache (header button, command). */
+	refreshNow(): void {
+		this.trigger("manual");
+	}
 
-		let delay: number;
-		switch (mode) {
-			case "manual": delay = 100; break;
-			case "switch": delay = this.plugin.settings.noteSwitchDebounceMs; break;
-			default: delay = this.plugin.settings.debounceMs; break;
+	private trigger(mode: Trigger): void {
+		if (this.busy) {
+			// Let the in-flight response finish (⏹ cancels it), then catch up once.
+			if (this.rerun !== "manual") this.rerun = mode;
+			return;
 		}
-
-		const bustCache = mode === "manual";
-		this.debounceTimer = setTimeout(() => {
-			// Lock — let the in-flight request finish; user can hit ⏹ to cancel.
-			if (this.busy) return;
-			this.refresh(bustCache).catch((err) => {
-				getLogger().error("context", "Refresh error", err);
-			});
+		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
+		const s = this.plugin.settings;
+		const delay = mode === "manual" ? 50 : mode === "switch" ? s.noteSwitchDebounceMs : s.debounceMs;
+		this.debounceTimer = window.setTimeout(() => {
+			this.debounceTimer = null;
+			void this.refresh(mode === "manual");
 		}, delay);
 	}
 
-	/** Abort the in-flight request (called by the ⏹ button). */
-	private stopInFlight() {
+	private stopInFlight(): void {
 		if (!this.busy) return;
+		this.rerun = null;
 		this.abortController?.abort();
-		this.setActivity("Stopped");
 	}
 
-	/** Toggle button enabled/active classes based on `busy`. */
-	private updateActionButtons() {
-		this.refreshBtn?.toggleClass("vaso-header-btn-disabled", this.busy);
-		this.stopBtn?.toggleClass("vaso-header-btn-disabled", !this.busy);
-		this.stopBtn?.toggleClass("vaso-header-btn-active", this.busy);
-	}
+	// ── Refresh ──────────────────────────────────────────────
 
-	// ── Status bar ───────────────────────────────────────────
-
-	renderStatusBar(): void {
-		if (!this.statusBarEl) return;
-		this.statusBarEl.empty();
-
-		const idx = this.plugin.vaultIndex;
-		const chunks = idx ? idx.chunks.length : 0;
-		const pages = idx ? new Set(idx.chunks.map((c) => c.filePath)).size : 0;
-		const builtAt = idx?.builtAt ? new Date(idx.builtAt).toLocaleTimeString() : "never";
-
-		const indexRow = this.statusBarEl.createDiv("vaso-sb-row");
-		const dot = indexRow.createEl("span", { cls: "vaso-sb-dot" });
-		if (this.plugin.indexing) dot.addClass("vaso-sb-dot-busy");
-		else if (chunks > 0) dot.addClass("vaso-sb-dot-ok");
-		else dot.addClass("vaso-sb-dot-off");
-
-		indexRow.createEl("span", { cls: "vaso-sb-label", text: "Index" });
-		indexRow.createEl("span", {
-			cls: "vaso-sb-value",
-			text: this.plugin.indexing ? "building…" : chunks > 0 ? `${chunks} chunks · ${pages} pages` : "not built",
-		});
-
-		if (chunks > 0 && !this.plugin.indexing) {
-			const builtRow = this.statusBarEl.createDiv("vaso-sb-row");
-			builtRow.createEl("span", { cls: "vaso-sb-dot vaso-sb-dot-spacer" });
-			builtRow.createEl("span", { cls: "vaso-sb-label", text: "Updated" });
-			builtRow.createEl("span", { cls: "vaso-sb-value", text: builtAt });
-		}
-
-		const tokRow = this.statusBarEl.createDiv("vaso-sb-row");
-		tokRow.createEl("span", { cls: "vaso-sb-dot vaso-sb-dot-spacer" });
-		tokRow.createEl("span", { cls: "vaso-sb-label", text: "Tokens" });
-		let tokText = "—";
-		if (this.lastStats) {
-			tokText = `${this.lastStats.promptTokens} in · ${this.lastStats.responseTokens} out`;
-			if (this.lastTps) {
-				tokText += ` · ${this.lastTps}`;
-			} else if (this.lastStats.totalDurationMs > 0) {
-				tokText += ` · ${(this.lastStats.totalDurationMs / 1000).toFixed(1)}s`;
-			}
-		}
-		tokRow.createEl("span", {
-			cls: "vaso-sb-value vaso-sb-tokens-text",
-			text: tokText,
-		});
-
-		const actRow = this.statusBarEl.createDiv("vaso-sb-row vaso-sb-activity");
-		actRow.createEl("span", { cls: "vaso-sb-dot vaso-sb-dot-spacer" });
-		actRow.createEl("span", { cls: "vaso-sb-label", text: "Last action" });
-		actRow.createEl("span", { cls: "vaso-sb-value vaso-sb-activity-text", text: this.lastActivity });
-	}
-
-	private setActivity(text: string) {
-		this.lastActivity = text;
-		const el = this.statusBarEl?.querySelector(".vaso-sb-activity-text");
-		if (el) el.textContent = text;
-	}
-
-	private setTokensText(text: string) {
-		const el = this.statusBarEl?.querySelector(".vaso-sb-tokens-text");
-		if (el) el.textContent = text;
-	}
-
-	// ── Main refresh ─────────────────────────────────────────
-
-	private async refresh(force = false): Promise<void> {
-		if (!this.plugin.settings.contextPanelEnabled) return;
-		if (!this.pipeline) return;
-		// Lock — `triggerRefresh` already filters, but guard direct callers too.
-		if (this.busy) return;
-
-		const activeFile = this.app.workspace.getActiveFile();
-		if (!activeFile || !(activeFile instanceof TFile)) {
-			this.setActivity("—");
+	private async refresh(force: boolean): Promise<void> {
+		if (this.busy || !this.plugin.settings.contextPanelEnabled) return;
+		const file = this.file;
+		if (!file) {
+			this.setActivity("Open a note to see its lore context.");
 			return;
 		}
 
-		const editor = this.app.workspace.activeEditor?.editor ?? undefined;
-
+		this.busy = true;
+		this.rerun = null;
 		this.abortController = new AbortController();
 		const signal = this.abortController.signal;
-		this.busy = true;
-		this.updateActionButtons();
+		this.updateButtons();
 
-		this.lastStats = null;
-		this.lastTps = null;
-		this.setTokensText("pending…");
-
-		const log = getLogger();
 		try {
-			let prepared;
-			try {
-				prepared = await this.pipeline.prepare(
-					activeFile,
-					editor,
-					{ force, signal, prevQueryText: this.lastQueryText },
-					{
-						embeddingParagraph: () => this.setActivity("Embedding paragraph…"),
-						embeddingNote: () => this.setActivity("Embedding note chunks…"),
-						searching: () => this.setActivity("Searching vault…"),
-						readingPages: () => this.setActivity("Reading source pages…"),
-					},
-					this.plugin.vaultIndex?.chunks ?? null,
-				);
-			} catch (err) {
-				if (String(err).includes("abort")) return;
-				log.error("context", "Pipeline error", err);
-				this.setActivity(`Error: ${String(err)}`);
-				return;
-			}
-
-			this.lastQueryText = prepared.queryText;
-
-			switch (prepared.run.kind) {
-				case "tooShort":
-					this.setActivity("Write more to get context…");
-					return;
-				case "noIndex":
-					this.setActivity("Index not built yet. Use the command palette to rebuild.");
-					return;
-				case "skipped":
-					return;
-				case "noMatches":
-					this.setActivity("No relevant matches found.");
-					if (this.contentEl_) {
-						this.contentEl_.empty();
-						this.contentEl_.createEl("p", {
-							cls: "vaso-placeholder",
-							text: "No relevant lore found for your current writing.",
-						});
-					}
-					return;
-				case "cached":
-					this.setActivity("Cached");
-					this.setTokensText("—");
-					this.renderResults(prepared.run.response, prepared.run.sources.l0, prepared.run.sources.l1, prepared.run.sources.l2);
-					return;
-				case "ready":
-					await this.runStreaming(activeFile.path, prepared.run, signal);
-					return;
+			const prepared = await this.pipeline.prepare(
+				file,
+				this.editorFor(file),
+				this.plugin.store.index,
+				{ force, signal, prevInputKey: this.lastInputKey },
+				{
+					embeddingParagraph: () => this.setActivity("Embedding paragraph…"),
+					embeddingNote: () => this.setActivity("Embedding note…"),
+					searching: () => this.setActivity("Searching the vault…"),
+					readingPages: () => this.setActivity("Reading source pages…"),
+				},
+			);
+			this.lastInputKey = prepared.inputKey;
+			await this.show(file, prepared.run, signal);
+		} catch (err) {
+			if (signal.aborted || isAbortError(err)) {
+				this.setActivity("Stopped");
+			} else {
+				getLogger().error("context", "Refresh failed", err);
+				this.setActivity(`Error: ${errorMessage(err)}`);
+				// Allow a retry on the next edit even if the text didn't change.
+				this.lastInputKey = "";
 			}
 		} finally {
 			this.busy = false;
 			this.abortController = null;
-			this.updateActionButtons();
+			this.updateButtons();
+			const again = this.rerun;
+			this.rerun = null;
+			if (again) this.trigger(again);
 		}
 	}
 
-	// ── LLM streaming ────────────────────────────────────────
+	private async show(file: TFile, run: PipelineRun, signal: AbortSignal): Promise<void> {
+		switch (run.kind) {
+			case "skipped":
+				return;
+			case "tooShort":
+				this.setActivity("Write a bit more to get context.");
+				return;
+			case "noIndex":
+				this.setActivity("The index is empty.");
+				this.renderStatus();
+				return;
+			case "indexProblem":
+				this.setActivity("The index needs a rebuild.");
+				this.plugin.store.reportMismatch(run.message);
+				return;
+			case "noMatches":
+				this.setActivity("No relevant lore found.");
+				this.renderPlaceholder("No relevant lore found for this note.");
+				return;
+			case "cached":
+				this.setActivity("Cached answer (sources unchanged)");
+				this.setTokens("—");
+				this.renderSynthesis(run.sources);
+				this.setAnswer(run.response, true);
+				return;
+			case "ready":
+				await this.stream(file, run, signal);
+				return;
+		}
+	}
 
-	private async runStreaming(
-		filePath: string,
-		ready: Extract<PipelineRun, { kind: "ready" }>,
+	private async stream(
+		file: TFile,
+		run: Extract<PipelineRun, { kind: "ready" }>,
 		signal: AbortSignal,
 	): Promise<void> {
 		const log = getLogger();
-		const settings = this.plugin.settings;
-		const { messages, sources, cacheKey } = ready;
-		const { l0, l1, l2 } = sources;
-
-		log.debug("context", "── LLM Prompt ──");
-		for (const m of messages) {
-			log.debug("context", `[${m.role}] (${m.content.length} chars):\n${m.content}`);
+		if (log.debugEnabled) {
+			for (const m of run.messages) log.debug("context", `[${m.role}] (${m.content.length} chars):\n${m.content}`);
 		}
-		log.debug("context", "── End Prompt ──");
 
-		this.setActivity("Connecting to LLM…");
-		this.prepareStreamingUI(l0, l1, l2);
+		const firstEp = this.plugin.settings.inferenceEndpoints[0];
+		let tag = firstEp ? PROVIDER_LABELS[firstEp.providerType] : "LLM";
+		const promptTokens = Math.round(run.messages.reduce((n, m) => n + m.content.length, 0) / 4);
+		let chunks = 0;
+		let startedAt = 0;
+		let answer = "";
 
-		let streamTokenCount = 0;
-		let generationStartTime = 0;
-		const promptCharCount = messages.reduce((n, m) => n + m.content.length, 0);
-		const estimatedPromptTokens = Math.round(promptCharCount / 4);
-		// Best guess from the first configured endpoint; corrected to the resolved one when the call returns.
-		let providerTag = settings.inferenceEndpoints.length > 0
-			? providerLabel(settings.inferenceEndpoints[0]!.providerType)
-			: "LLM";
-
-		const updateTokensWithTps = () => {
-			if (generationStartTime <= 0) return;
-			const elapsed = (Date.now() - generationStartTime) / 1000;
-			const tps = elapsed > 0.3 && streamTokenCount > 2
-				? ` · ${(streamTokenCount / elapsed).toFixed(1)} t/s`
-				: "";
-			this.setTokensText(`~${estimatedPromptTokens} in · ${streamTokenCount} out${tps}`);
+		const phaseText: Record<StreamPhase, string> = {
+			loading: "Loading model…",
+			processing: "Processing prompt…",
+			reasoning: "Thinking…",
+			generating: "Writing…",
+			done: "Done",
 		};
 
-		const statusText = (phase: StreamPhase, detail?: string): string => {
-			switch (phase) {
-				case "loading":    return detail ?? "Loading model…";
-				case "processing": return "Processing prompt…";
-				case "reasoning":  return "Thinking…";
-				case "generating": return "Generating…";
-				case "done":       return "Done";
-			}
-		};
+		this.renderSynthesis(run.sources);
+		this.setAnswer("", false);
+		this.setActivity("Connecting…");
+		this.setTokens(`~${promptTokens} in · waiting…`);
 
-		this.setTokensText(`~${estimatedPromptTokens} in · streaming…`);
 		try {
-			const result = await chatStreamWithStatus(messages, settings, {
-				onStatus: (phase, detail) => {
-					if (phase === "done") return;
-					if (phase === "generating" && generationStartTime <= 0) {
-						generationStartTime = Date.now();
-					}
-					this.setActivity(`[${providerTag}] ${statusText(phase, detail)}`);
+			const result = await chatStreamWithStatus(
+				run.messages,
+				this.plugin.settings,
+				{
+					onStatus: (phase, detail) => {
+						if (phase === "done") return;
+						if (phase === "generating" && !startedAt) startedAt = Date.now();
+						this.setActivity(`[${tag}] ${detail ?? phaseText[phase]}`);
+					},
+					onChunk: (text) => {
+						if (!startedAt) {
+							startedAt = Date.now();
+							this.setActivity(`[${tag}] ${phaseText.generating}`);
+						}
+						chunks++;
+						answer = text;
+						this.queueStream({ answer: text });
+						const secs = (Date.now() - startedAt) / 1000;
+						const rate = secs > 0.3 && chunks > 2 ? ` · ${(chunks / secs).toFixed(1)} t/s` : "";
+						this.setTokens(`~${promptTokens} in · ${chunks} out${rate}`);
+					},
+					onReasoning: (text) => this.queueStream({ reasoning: text }),
 				},
-				onChunk: (accumulated) => {
-					if (generationStartTime <= 0) {
-						generationStartTime = Date.now();
-						this.setActivity(`[${providerTag}] ${statusText("generating")}`);
-					}
-					streamTokenCount++;
-					this.updateStreamingContent(accumulated);
-					updateTokensWithTps();
-				},
-				onReasoning: (accumulated) => {
-					this.updateReasoningContent(accumulated);
-				},
-			}, signal);
+				signal,
+			);
 
-			providerTag = providerLabel(result.endpoint.providerType);
-			if (result.stats) {
-				this.lastStats = result.stats;
-				log.info(
-					"context",
-					`Tokens: ${result.stats.promptTokens} in, ${result.stats.responseTokens} out, ${(result.stats.totalDurationMs / 1000).toFixed(1)}s`,
-				);
-			}
+			tag = PROVIDER_LABELS[result.endpoint.providerType];
+			this.flushStream();
+			this.setAnswer(result.text, true);
+			const secs = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+			const out = result.stats?.responseTokens ?? chunks;
+			const inTok = result.stats ? `${result.stats.promptTokens}` : `~${promptTokens}`;
+			this.setTokens(`${inTok} in · ${out} out${secs > 0 && out > 0 ? ` · ${(out / secs).toFixed(1)} t/s` : ""}`);
+			this.setActivity(`[${tag}] Done`);
 
-			const totalElapsed = generationStartTime > 0 ? (Date.now() - generationStartTime) / 1000 : 0;
-			const finalTokens = result.stats?.responseTokens ?? streamTokenCount;
-			this.lastTps = totalElapsed > 0 && finalTokens > 0
-				? `${(finalTokens / totalElapsed).toFixed(1)} t/s`
-				: null;
-
-			if (result.text) {
-				this.pipeline?.storeResponse(filePath, cacheKey, result.text);
-			}
-			this.renderStatusBar();
-			this.setActivity("Done");
+			if (result.text) this.pipeline.storeResponse(file.path, run.cacheKey, result.text);
 		} catch (err) {
-			log.warn("context", "LLM unreachable, showing raw results", err);
-			this.renderResults(null, l0, l1, l2);
-			this.setTokensText("—");
+			this.flushStream();
+			if (signal.aborted || isAbortError(err)) {
+				// Keep whatever arrived before ⏹.
+				this.setAnswer(answer, true, answer ? undefined : "Stopped before any text arrived.");
+				this.setActivity("Stopped");
+				return;
+			}
+			log.warn("context", "LLM request failed", err);
+			this.setAnswer("", true, `LLM unavailable — ${errorMessage(err)}. The matched sources are below.`);
+			this.setTokens("—");
 			this.setActivity("LLM unavailable");
 		}
 	}
 
-	// ── UI rendering ─────────────────────────────────────────
+	// ── Status ───────────────────────────────────────────────
 
-	/** Render the sources section (shared by streaming prep and final render). */
-	private renderSourcesSection(
-		parent: HTMLElement,
-		l0: SearchResult[],
-		l1: SearchResult[],
-		l2: SearchResult[]
-	) {
-		if (l0.length === 0 && l1.length === 0 && l2.length === 0) return;
-		const section = parent.createDiv("vaso-sources");
-		section.createEl("h5", { text: "Sources" });
-		for (const r of l0) this.renderSourceCard(section, r, "l0");
-		for (const r of l1) this.renderSourceCard(section, r, "l1");
-		for (const r of l2) this.renderSourceCard(section, r, "l2");
-	}
+	/** Index state, problems and quick actions. Called by the plugin on index changes. */
+	renderStatus(): void {
+		if (!this.statusEl) return;
+		const store = this.plugin.store;
+		const settings = this.plugin.settings;
+		this.statusEl.empty();
 
-	private prepareStreamingUI(l0: SearchResult[], l1: SearchResult[], l2: SearchResult[]) {
-		if (!this.contentEl_) return;
-		this.contentEl_.empty();
-
-		const synthSection = this.contentEl_.createDiv("vaso-synthesis");
-		synthSection.createEl("h5", { text: "Relevant Facts" });
-		const synthBody = synthSection.createDiv("vaso-synthesis-body");
-		synthBody.addClass("vaso-streaming-body");
-		synthBody.createEl("span", { cls: "vaso-muted", text: "Generating…" });
-
-		this.renderSourcesSection(this.contentEl_, l0, l1, l2);
-	}
-
-	private updateReasoningContent(accumulated: string) {
-		if (!this.contentEl_) return;
-		const synthSection = this.contentEl_.querySelector(".vaso-synthesis");
-		if (!synthSection) return;
-
-		let wrapper = synthSection.querySelector(".vaso-reasoning") as HTMLElement | null;
-		if (!wrapper) {
-			// Insert reasoning block before the streaming body so it appears first.
-			const streamBody = synthSection.querySelector(".vaso-streaming-body");
-			wrapper = createDiv("vaso-reasoning");
-			const toggle = wrapper.createEl("span", {
-				cls: "vaso-reasoning-toggle",
-				text: "Thinking…",
-			});
-			const body = wrapper.createDiv("vaso-reasoning-body");
-			body.addClass("vaso-collapsed");
-			toggle.addEventListener("click", () => {
-				const open = !body.hasClass("vaso-collapsed");
-				body.toggleClass("vaso-collapsed", open);
-				toggle.textContent = open ? "Thinking…" : "Thinking ▾";
-				toggle.toggleClass("vaso-reasoning-open", !open);
-			});
-			if (streamBody) {
-				synthSection.insertBefore(wrapper, streamBody);
-			} else {
-				synthSection.appendChild(wrapper);
-			}
-		}
-
-		const body = wrapper.querySelector(".vaso-reasoning-body") as HTMLElement | null;
-		if (body) {
-			body.empty();
-			MarkdownRenderer.render(this.app, accumulated, body, "", this.plugin);
-		}
-	}
-
-	private updateStreamingContent(partial: string) {
-		const body = this.contentEl_?.querySelector(".vaso-streaming-body");
-		if (!body) return;
-		body.empty();
-		MarkdownRenderer.render(this.app, partial, body as HTMLElement, "", this.plugin);
-	}
-
-	private renderResults(
-		llmResponse: string | null,
-		l0: SearchResult[],
-		l1: SearchResult[],
-		l2: SearchResult[]
-	) {
-		if (!this.contentEl_) return;
-		this.contentEl_.empty();
-
-		const synthSection = this.contentEl_.createDiv("vaso-synthesis");
-		synthSection.createEl("h5", { text: "Relevant Facts" });
-		if (llmResponse) {
-			const synthBody = synthSection.createDiv("vaso-synthesis-body");
-			MarkdownRenderer.render(this.app, llmResponse, synthBody, "", this.plugin);
-		} else {
-			synthSection.createEl("p", {
-				cls: "vaso-muted",
-				text: "LLM unavailable — showing raw matches below.",
-			});
-		}
-
-		this.renderSourcesSection(this.contentEl_, l0, l1, l2);
-	}
-
-	private renderSourceCard(
-		parent: HTMLElement,
-		result: SearchResult,
-		layer: "l0" | "l1" | "l2"
-	) {
-		const card = parent.createDiv("vaso-source-card");
-		const headerRow = card.createDiv("vaso-source-header");
-
-		const nameEl = headerRow.createEl("span", {
-			cls: "vaso-source-name",
-			text: result.chunk.pageName,
-		});
-		nameEl.addEventListener("click", () => {
-			const file = this.app.vault.getAbstractFileByPath(result.chunk.filePath);
-			if (file instanceof TFile) {
-				this.app.workspace.getLeaf(false).openFile(file);
-			}
-		});
-
-		const badgeLabels = { l0: "L0", l1: "L1", l2: "L2" };
-		const badgeTitles = {
-			l0: "Paragraph-focused match (chunk only)",
-			l1: "Note-relevant match (full page sent)",
-			l2: "Broad context match (chunk only)",
+		const row = (label: string, value: string, cls = "") => {
+			const r = this.statusEl.createDiv("vaso-status-row " + cls);
+			r.createSpan({ cls: "vaso-status-label", text: label });
+			return r.createSpan({ cls: "vaso-status-value", text: value });
 		};
-		headerRow.createEl("span", {
-			cls: `vaso-source-badge vaso-badge-${layer}`,
-			text: badgeLabels[layer],
-			title: badgeTitles[layer],
+
+		const indexRow = this.statusEl.createDiv("vaso-status-row");
+		const dot = indexRow.createSpan("vaso-dot");
+		indexRow.createSpan({ cls: "vaso-status-label", text: "Index" });
+		const value = indexRow.createSpan("vaso-status-value");
+
+		const progress = store.progress;
+		const configMismatch = store.index ? indexMismatch(store.index, settings) : null;
+		let problem: string | null = store.problem;
+		let action: "rebuild" | "update" | null = store.needsRebuild ? "rebuild" : problem ? "update" : null;
+		if (!hasIndexScope(settings)) {
+			problem = "No folders are selected for indexing yet. Choose them in Settings → Vaso → Index.";
+			action = null;
+		} else if (configMismatch) {
+			problem = `${configMismatch} Rebuild the index.`;
+			action = "rebuild";
+		} else if (store.chunkCount === 0 && !problem) {
+			problem = "The index hasn't been built yet.";
+			action = "update";
+		}
+
+		if (progress) {
+			dot.addClass("is-busy");
+			value.setText(progress.total > 0 ? `${progress.label} ${progress.done}/${progress.total}` : `${progress.label}…`);
+		} else if (store.chunkCount > 0) {
+			dot.addClass(problem ? "is-warn" : "is-ok");
+			value.setText(`${store.chunkCount} chunks · ${store.pageCount} pages`);
+			if (store.index) setTooltip(value, `Last updated ${new Date(store.index.builtAt).toLocaleString()}`);
+		} else {
+			dot.addClass(problem ? "is-warn" : "is-off");
+			value.setText("not built");
+		}
+
+		if (problem && !progress) {
+			const box = this.statusEl.createDiv("vaso-status-problem");
+			box.createSpan({ text: problem });
+			if (action) {
+				const btn = box.createEl("button", {
+					cls: "mod-cta",
+					text: action === "rebuild" ? "Rebuild index" : store.chunkCount === 0 ? "Build index" : "Retry",
+				});
+				btn.addEventListener("click", () => void (action === "rebuild" ? store.rebuild() : store.update(true)));
+			}
+		}
+
+		row("Tokens", this.tokensText, "vaso-status-tokens");
+		row("Status", this.activityText, "vaso-status-activity");
+	}
+
+	private setActivity(text: string): void {
+		this.activityText = text;
+		const el = this.statusEl?.querySelector(".vaso-status-activity .vaso-status-value");
+		if (el) el.textContent = text;
+	}
+
+	private setTokens(text: string): void {
+		this.tokensText = text;
+		const el = this.statusEl?.querySelector(".vaso-status-tokens .vaso-status-value");
+		if (el) el.textContent = text;
+	}
+
+	private updateButtons(): void {
+		this.refreshBtn?.toggleClass("is-disabled", this.busy);
+		this.stopBtn?.toggleClass("is-disabled", !this.busy);
+		this.stopBtn?.toggleClass("is-active", this.busy);
+	}
+
+	// ── Body rendering ───────────────────────────────────────
+
+	private renderPlaceholder(text: string): void {
+		this.clearMarkdown();
+		this.bodyEl.empty();
+		this.bodyEl.createDiv({ cls: "vaso-placeholder", text });
+	}
+
+	/** Lay out the answer area and the source list. */
+	private renderSynthesis(sources: ThreeLayerResult): void {
+		this.clearMarkdown();
+		this.renderSeq++;
+		this.bodyEl.empty();
+
+		const synth = this.bodyEl.createDiv("vaso-synthesis");
+		const head = synth.createDiv("vaso-section-head");
+		head.createDiv({ cls: "vaso-section-title", text: "Relevant facts" });
+		this.iconButton(head, "copy", "Copy answer", () => {
+			if (!this.answerText) return;
+			void navigator.clipboard.writeText(this.answerText).then(() => new Notice("Copied"));
+		});
+		synth.createDiv("vaso-reasoning");
+		synth.createDiv("vaso-answer");
+
+		const all = [
+			...sources.l0.map((r) => [r, "l0"] as const),
+			...sources.l1.map((r) => [r, "l1"] as const),
+			...sources.l2.map((r) => [r, "l2"] as const),
+		];
+		if (all.length === 0) return;
+		const list = this.bodyEl.createDiv("vaso-sources");
+		list.createDiv({ cls: "vaso-section-title", text: "Sources" });
+		for (const [r, layer] of all) this.renderSourceCard(list, r, layer);
+	}
+
+	/**
+	 * Show answer text. `final` renders immediately; `note` replaces an empty
+	 * answer with a muted message.
+	 */
+	private setAnswer(text: string, final: boolean, note?: string): void {
+		const el = this.bodyEl.querySelector<HTMLElement>(".vaso-answer");
+		if (!el) return;
+		this.answerText = text;
+		if (!text) {
+			this.clearMarkdown("answer");
+			el.empty();
+			el.createDiv({ cls: "vaso-muted", text: note ?? (final ? "No answer." : "Waiting for the model…") });
+			return;
+		}
+		void this.renderMarkdown("answer", el, text);
+	}
+
+	private setReasoning(text: string): void {
+		const wrap = this.bodyEl.querySelector<HTMLElement>(".vaso-reasoning");
+		if (!wrap || !text) return;
+		let details = wrap.querySelector("details");
+		if (!details) {
+			details = wrap.createEl("details");
+			details.createEl("summary", { text: "Thinking" });
+			details.createDiv("vaso-reasoning-body");
+		}
+		const body = details.querySelector<HTMLElement>(".vaso-reasoning-body");
+		// Only re-render while it's open; the summary is enough when collapsed.
+		if (body && details.open) void this.renderMarkdown("reasoning", body, text);
+		else if (body) body.dataset.pending = text;
+		details.ontoggle = () => {
+			const pending = body?.dataset.pending;
+			if (details?.open && body && pending) {
+				delete body.dataset.pending;
+				void this.renderMarkdown("reasoning", body, pending);
+			}
+		};
+	}
+
+	private queueStream(part: { answer?: string; reasoning?: string }): void {
+		Object.assign(this.streamPending, part);
+		if (this.streamTimer !== null) return;
+		this.streamTimer = window.setTimeout(() => this.flushStream(), STREAM_RENDER_MS);
+	}
+
+	private flushStream(): void {
+		if (this.streamTimer !== null) window.clearTimeout(this.streamTimer);
+		this.streamTimer = null;
+		const { answer, reasoning } = this.streamPending;
+		this.streamPending = {};
+		if (reasoning !== undefined) this.setReasoning(reasoning);
+		if (answer !== undefined) this.setAnswer(answer, false);
+	}
+
+	/** Render Markdown into `el`, owning one child Component per slot so old renders unload. */
+	private async renderMarkdown(slot: string, el: HTMLElement, markdown: string): Promise<void> {
+		const seq = this.renderSeq;
+		const n = (this.slotSeq.get(slot) ?? 0) + 1;
+		this.slotSeq.set(slot, n);
+		const component = this.addChild(new Component());
+		const fresh = createDiv();
+		await MarkdownRenderer.render(this.app, markdown, fresh, this.file?.path ?? "", component);
+		if (seq !== this.renderSeq || this.slotSeq.get(slot) !== n || !el.isConnected) {
+			this.removeChild(component);
+			return;
+		}
+		el.replaceChildren(...Array.from(fresh.childNodes));
+		const old = this.markdownParts.get(slot);
+		if (old) this.removeChild(old);
+		this.markdownParts.set(slot, component);
+	}
+
+	private clearMarkdown(slot?: string): void {
+		for (const [key, c] of this.markdownParts) {
+			if (slot && key !== slot) continue;
+			this.removeChild(c);
+			this.markdownParts.delete(key);
+		}
+	}
+
+	private renderSourceCard(parent: HTMLElement, result: SearchResult, layer: keyof typeof LAYER_INFO): void {
+		const card = parent.createDiv("vaso-source");
+		const head = card.createDiv("vaso-source-head");
+
+		const name = head.createEl("a", { cls: "vaso-source-name", text: result.chunk.pageName, href: "#" });
+		name.addEventListener("click", (evt) => {
+			evt.preventDefault();
+			evt.stopPropagation();
+			const file = this.app.vault.getAbstractFileByPath(result.chunk.filePath);
+			if (file instanceof TFile) void this.app.workspace.getLeaf(false).openFile(file);
 		});
 
-		headerRow.createEl("span", {
-			cls: "vaso-source-sim",
-			text: `${(result.similarity * 100).toFixed(1)}%`,
-		});
+		const badge = head.createSpan({ cls: `vaso-badge vaso-badge-${layer}`, text: LAYER_INFO[layer].label });
+		setTooltip(badge, LAYER_INFO[layer].title);
+		head.createSpan({ cls: "vaso-source-sim", text: `${(result.similarity * 100).toFixed(0)}%` });
+		const chevron = head.createSpan("vaso-source-chevron");
+		setIcon(chevron, "chevron-down");
 
-		const preview = card.createDiv("vaso-source-preview");
-		preview.textContent =
-			result.chunk.text.length > 200
-				? result.chunk.text.slice(0, 200) + "…"
-				: result.chunk.text;
-		preview.addClass("vaso-collapsed");
-
-		headerRow.addEventListener("click", (e) => {
-			if ((e.target as HTMLElement).classList.contains("vaso-source-name")) return;
-			preview.toggleClass("vaso-collapsed", !preview.hasClass("vaso-collapsed"));
+		const preview = card.createDiv({ cls: "vaso-source-preview vaso-hidden" });
+		preview.setText(result.chunk.text.length > 280 ? result.chunk.text.slice(0, 280) + "…" : result.chunk.text);
+		head.addEventListener("click", () => {
+			const open = preview.hasClass("vaso-hidden");
+			preview.toggleClass("vaso-hidden", !open);
+			card.toggleClass("is-open", open);
 		});
+	}
+
+	// ── Helpers ──────────────────────────────────────────────
+
+	private iconButton(parent: HTMLElement, icon: string, label: string, onClick: () => void): HTMLElement {
+		const btn = parent.createDiv({ cls: "clickable-icon vaso-icon-btn", attr: { "aria-label": label, role: "button" } });
+		setIcon(btn, icon);
+		btn.addEventListener("click", (evt) => {
+			evt.stopPropagation();
+			onClick();
+		});
+		return btn;
+	}
+
+	/** Editor of an open Markdown view showing `file`, if any (focus may be in the panel). */
+	private editorFor(file: TFile): Editor | undefined {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (active?.file === file) return active.editor;
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view;
+			if (view instanceof MarkdownView && view.file === file) return view.editor;
+		}
+		return undefined;
 	}
 }

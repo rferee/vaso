@@ -1,17 +1,20 @@
 /**
- * Public LLM facade — drop-in replacement for the old `ollama.ts`.
- *
- * Every function resolves the best reachable endpoint from the settings list,
- * then delegates to the appropriate provider. Callers never touch providers
- * directly.
+ * LLM facade. Resolves the first reachable endpoint from the settings list and
+ * delegates to its provider; the rest of the plugin never touches providers.
  */
 
-import type { VasoSettings, EndpointConfig } from "./types";
-import {
-	resolveEndpoint,
-	getProviderForEndpoint,
-	clearResolveCache,
-} from "./providers/registry";
+import type { EndpointConfig, VasoSettings } from "./types";
+import { resolveEndpoint, getProviderForEndpoint, clearResolveCache, checkEndpoint } from "./providers/registry";
+import type {
+	ChatMessage,
+	ChatStreamResult,
+	ModelEntry,
+	ModelInfo,
+	StreamCallback,
+} from "./providers/types";
+import { toUnitVector } from "./vectors";
+import type { Vector } from "./vectors";
+import { getLogger } from "./logger";
 
 export type {
 	ChatMessage,
@@ -23,139 +26,96 @@ export type {
 	ModelInfo,
 } from "./providers/types";
 
-export { clearResolveCache };
+export { clearResolveCache, checkEndpoint };
 
 // ── Model discovery ─────────────────────────────────────────────
 
-import type { ModelEntry, ModelInfo } from "./providers/types";
-
-/**
- * List models available on the given endpoint.
- * (Uses the endpoint directly — no resolution needed.)
- */
-export async function listModels(ep: EndpointConfig): Promise<ModelEntry[]> {
-	const provider = getProviderForEndpoint(ep);
-	return provider.listModels(ep);
+export function listModels(ep: EndpointConfig): Promise<ModelEntry[]> {
+	return getProviderForEndpoint(ep).listModels(ep);
 }
 
-/**
- * Get detailed model info. Returns null if the provider doesn't support it.
- */
-export async function showModel(
-	ep: EndpointConfig,
-	modelName: string
-): Promise<ModelInfo | null> {
-	const provider = getProviderForEndpoint(ep);
-	return provider.showModel(ep, modelName);
+/** Detailed model info, or null when the provider doesn't expose it. */
+export function showModel(ep: EndpointConfig, modelName: string): Promise<ModelInfo | null> {
+	return getProviderForEndpoint(ep).showModel(ep, modelName);
 }
 
-/**
- * Unload all loaded models on the given endpoint.
- * Returns the count of models unloaded, or null if not supported.
- */
+/** Unload every loaded model. Returns the count, or null when unsupported. */
 export async function unloadAllModels(ep: EndpointConfig): Promise<number | null> {
 	const provider = getProviderForEndpoint(ep);
-	if (!provider.unloadAllModels) return null;
-	return provider.unloadAllModels(ep);
+	return provider.unloadAllModels ? provider.unloadAllModels(ep) : null;
 }
 
 // ── Embedding ───────────────────────────────────────────────────
 
-/** Get embedding vector for a single text. */
-export async function embed(
-	text: string,
-	settings: VasoSettings,
-	signal?: AbortSignal
-): Promise<number[]> {
-	signal?.throwIfAborted();
-	const ep = await resolveEndpoint(settings.embeddingEndpoints);
-	const provider = getProviderForEndpoint(ep);
-	const vecs = await provider.embedBatch(ep, [text]);
-	const vec = vecs[0];
-	if (!vec || vec.length === 0) {
-		throw new Error("Invalid embedding response");
-	}
-	return vec;
-}
-
-/** Batch-embed multiple texts. Falls back to one-at-a-time on batch failure. */
-export async function embedBatch(
-	texts: string[],
-	settings: VasoSettings,
-	signal?: AbortSignal
-): Promise<number[][]> {
-	if (texts.length === 0) return [];
-	signal?.throwIfAborted();
-
-	const ep = await resolveEndpoint(settings.embeddingEndpoints);
-	const provider = getProviderForEndpoint(ep);
-
-	// Try the whole batch first
-	try {
-		return await provider.embedBatch(ep, texts);
-	} catch {
-		// Fall back to one-at-a-time
-	}
-
-	const { getLogger } = await import("./logger");
-	getLogger().warn(
-		"embed",
-		`Batch embed failed (${texts.length} texts), falling back to one-at-a-time`
-	);
-
-	const results: number[][] = [];
-	for (let i = 0; i < texts.length; i++) {
-		try {
-			const vecs = await provider.embedBatch(ep, [texts[i]!]);
-			results.push(vecs[0]!);
-		} catch {
-			getLogger().warn(
-				"embed",
-				`Single embed failed for text #${i}, using zero vector`
-			);
-			results.push([]);
-		}
-	}
-	return results;
-}
-
-// ── Chat (inference) ────────────────────────────────────────────
-
-import type { ChatMessage, ChatStreamResult, StreamCallback } from "./providers/types";
-
-/** Result of chatStreamWithStatus — includes endpoint metadata for UI. */
-export interface ChatStreamWithStatusResult extends ChatStreamResult {
-	/** Resolved endpoint that handled the request. */
-	endpoint: EndpointConfig;
-}
-
-/** Human-readable label for a provider type. */
-const PROVIDER_LABELS: Record<import("./types").ProviderType, string> = {
-	ollama: "Ollama",
-	openrouter: "OpenRouter",
-	lmstudio: "LM Studio",
-	"openai-compat": "OpenAI",
-};
-
-/** Get a display label for a provider type. */
-export function providerLabel(pt: import("./types").ProviderType): string {
-	return PROVIDER_LABELS[pt] ?? pt;
+export function resolveEmbeddingEndpoint(settings: VasoSettings): Promise<EndpointConfig> {
+	return resolveEndpoint(settings.embeddingEndpoints, "embed");
 }
 
 /**
- * Streaming chat with full StreamCallback (status phases + content).
- * Use this for the sidebar where status display is needed.
- * Returns the result plus the resolved endpoint for UI labelling.
+ * Embed texts with one endpoint and return unit vectors. A failed batch is
+ * retried one text at a time; texts that still fail come back as null. Throws
+ * when nothing could be embedded (the endpoint is down).
  */
+export async function embedTexts(
+	ep: EndpointConfig,
+	texts: string[],
+	signal?: AbortSignal,
+): Promise<(Vector | null)[]> {
+	if (texts.length === 0) return [];
+	signal?.throwIfAborted();
+	const provider = getProviderForEndpoint(ep);
+	const unit = (v: number[] | undefined) => (v && v.length > 0 ? toUnitVector(v) : null);
+
+	try {
+		const vecs = await provider.embedBatch(ep, texts);
+		return texts.map((_, i) => unit(vecs[i]));
+	} catch (err) {
+		if (texts.length === 1) throw err;
+		getLogger().warn("embed", `Batch of ${texts.length} failed, retrying one at a time`, err);
+	}
+
+	const out: (Vector | null)[] = [];
+	let lastError: unknown;
+	for (const text of texts) {
+		signal?.throwIfAborted();
+		try {
+			out.push(unit((await provider.embedBatch(ep, [text]))[0]));
+		} catch (err) {
+			lastError = err;
+			out.push(null);
+		}
+	}
+	if (out.every((v) => v === null)) throw lastError ?? new Error("Embedding failed");
+	return out;
+}
+
+/** Embed a single query text. */
+export async function embedQuery(
+	ep: EndpointConfig,
+	text: string,
+	signal?: AbortSignal,
+): Promise<Vector> {
+	const [vec] = await embedTexts(ep, [text], signal);
+	if (!vec) throw new Error("The embedding endpoint returned an empty vector");
+	return vec;
+}
+
+// ── Chat ────────────────────────────────────────────────────────
+
+export interface ChatStreamWithStatusResult extends ChatStreamResult {
+	/** Endpoint that handled the request. */
+	endpoint: EndpointConfig;
+}
+
+/** Streaming chat on the first reachable inference endpoint. */
 export async function chatStreamWithStatus(
 	messages: ChatMessage[],
 	settings: VasoSettings,
 	cb: StreamCallback,
-	signal?: AbortSignal
+	signal?: AbortSignal,
 ): Promise<ChatStreamWithStatusResult> {
 	signal?.throwIfAborted();
 	const ep = await resolveEndpoint(settings.inferenceEndpoints, "infer");
-	const provider = getProviderForEndpoint(ep);
-	const result = await provider.chatStream(ep, messages, cb, signal);
+	const result = await getProviderForEndpoint(ep).chatStream(ep, messages, cb, signal);
 	return { ...result, endpoint: ep };
 }

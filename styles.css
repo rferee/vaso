@@ -1,94 +1,89 @@
 /* ── Vaso — Context Panel ─────────────────────────── */
 
 .vaso-container {
-	padding: 12px;
 	display: flex;
 	flex-direction: column;
-	height: 100%;
-	overflow: hidden;
+	gap: var(--size-4-2);
+	padding: var(--size-4-3);
 }
 
 .vaso-header {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	margin-bottom: 8px;
+	gap: var(--size-4-2);
 }
 
-.vaso-header h4 {
-	margin: 0;
-	font-size: 1.1em;
+.vaso-title {
+	font-weight: var(--font-semibold);
+	font-size: var(--font-ui-medium);
 }
 
-.vaso-header-btns {
+.vaso-header-actions {
 	display: flex;
-	gap: 4px;
+	gap: var(--size-4-1);
 }
 
-.vaso-header-btn {
-	cursor: pointer;
-	font-size: 1.2em;
-	color: var(--text-muted);
-	padding: 2px 6px;
-	border-radius: 4px;
-}
-
-.vaso-header-btn:hover {
-	color: var(--text-normal);
-	background: var(--background-modifier-hover);
-}
-
-.vaso-header-btn-disabled {
+.vaso-icon-btn.is-disabled {
 	opacity: 0.35;
-	cursor: not-allowed;
 	pointer-events: none;
 }
 
-/* Highlight the stop button while a request is in flight. */
-.vaso-header-btn-stop.vaso-header-btn-active {
+.vaso-icon-btn.is-active {
 	color: var(--text-error);
 }
 
-/* ── Status Bar ───────────────────────────────────────── */
+/* ── Status ───────────────────────────────────────── */
 
-.vaso-statusbar {
-	font-size: 0.8em;
-	margin-bottom: 10px;
-	padding: 8px 10px;
-	border-radius: 6px;
+.vaso-status {
+	font-size: var(--font-ui-smaller);
+	padding: var(--size-4-2) var(--size-4-3);
+	border-radius: var(--radius-m);
 	background: var(--background-secondary);
 	border: 1px solid var(--background-modifier-border);
 }
 
-.vaso-sb-row {
+.vaso-status-row {
 	display: flex;
-	align-items: center;
-	gap: 6px;
+	align-items: baseline;
+	gap: var(--size-4-2);
 	line-height: 1.8;
+	min-width: 0;
 }
 
-.vaso-sb-dot {
+.vaso-status-label {
+	color: var(--text-muted);
+	white-space: nowrap;
+	min-width: 4.5em;
+}
+
+.vaso-status-value {
+	color: var(--text-normal);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
+}
+
+.vaso-status-activity .vaso-status-value {
+	white-space: normal;
+}
+
+.vaso-dot {
 	width: 7px;
 	height: 7px;
 	border-radius: 50%;
 	flex-shrink: 0;
-}
-
-.vaso-sb-dot-ok {
-	background: #4ade80;
-}
-
-.vaso-sb-dot-busy {
-	background: #facc15;
-	animation: vaso-pulse 1s infinite;
-}
-
-.vaso-sb-dot-off {
+	align-self: center;
+	margin-right: -2px;
 	background: var(--text-faint);
 }
 
-.vaso-sb-dot-spacer {
-	visibility: hidden;
+.vaso-dot.is-ok { background: var(--color-green); }
+.vaso-dot.is-warn { background: var(--color-orange); }
+.vaso-dot.is-busy {
+	background: var(--color-yellow);
+	animation: vaso-pulse 1s infinite;
 }
 
 @keyframes vaso-pulse {
@@ -96,184 +91,169 @@
 	50% { opacity: 0.3; }
 }
 
-.vaso-sb-label {
-	color: var(--text-muted);
-	white-space: nowrap;
-	min-width: 52px;
-}
-
-.vaso-sb-value {
+.vaso-status-problem {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--size-4-2);
+	margin: var(--size-4-1) 0;
+	padding: var(--size-4-2);
+	border-radius: var(--radius-s);
+	background: var(--background-modifier-error-hover, var(--background-primary));
 	color: var(--text-normal);
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	line-height: 1.4;
 }
 
-.vaso-content {
-	flex: 1;
-	overflow-y: auto;
-}
+/* ── Body ─────────────────────────────────────────── */
 
 .vaso-placeholder {
 	color: var(--text-faint);
 	text-align: center;
-	margin-top: 40px;
+	margin-top: var(--size-4-8);
 	font-style: italic;
 }
 
 .vaso-muted {
 	color: var(--text-faint);
 	font-style: italic;
-	font-size: 0.9em;
+	font-size: var(--font-ui-small);
 }
 
-/* ── Synthesis section ────────────────────────────────── */
+.vaso-section-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.vaso-section-title {
+	font-weight: var(--font-semibold);
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+	margin: var(--size-4-1) 0 var(--size-4-2);
+}
 
 .vaso-synthesis {
-	margin-bottom: 16px;
-	padding-bottom: 12px;
+	padding-bottom: var(--size-4-3);
+	margin-bottom: var(--size-4-3);
 	border-bottom: 1px solid var(--background-modifier-border);
 }
 
-.vaso-synthesis h5 {
-	margin: 0 0 8px 0;
-	font-size: 0.95em;
+.vaso-synthesis .vaso-section-title {
 	color: var(--text-accent);
 }
 
-.vaso-synthesis-body {
-	font-size: 0.9em;
+.vaso-answer {
+	font-size: var(--font-ui-small);
 	line-height: 1.5;
+	user-select: text;
 }
 
-.vaso-synthesis-body ul {
+.vaso-answer ul {
 	margin: 0;
-	padding-left: 18px;
+	padding-left: 1.2em;
 }
 
-.vaso-synthesis-body li {
-	margin-bottom: 4px;
+.vaso-answer li {
+	margin-bottom: var(--size-4-1);
 }
 
-/* ── Reasoning / Thinking block ──────────────────────── */
-
-.vaso-reasoning {
-	margin-bottom: 8px;
+.vaso-reasoning details {
+	margin-bottom: var(--size-4-2);
 }
 
-.vaso-reasoning-toggle {
-	display: inline-block;
-	font-size: 0.85em;
-	color: var(--text-muted);
-	font-style: italic;
+.vaso-reasoning summary {
 	cursor: pointer;
-	padding: 2px 0;
-	user-select: none;
-}
-
-.vaso-reasoning-toggle:hover {
-	color: var(--text-normal);
-}
-
-.vaso-reasoning-open {
-	font-style: normal;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-style: italic;
 }
 
 .vaso-reasoning-body {
-	font-size: 0.82em;
+	font-size: var(--font-ui-smaller);
 	color: var(--text-muted);
 	line-height: 1.45;
-	margin-top: 4px;
-	padding: 6px 10px;
+	margin-top: var(--size-4-1);
+	padding: var(--size-4-2) var(--size-4-3);
 	border-left: 2px solid var(--background-modifier-border);
 	background: var(--background-secondary);
-	border-radius: 0 4px 4px 0;
 	max-height: 300px;
 	overflow-y: auto;
 }
 
-/* ── Sources section ──────────────────────────────────── */
+/* ── Sources ──────────────────────────────────────── */
 
-.vaso-sources h5 {
-	margin: 0 0 8px 0;
-	font-size: 0.95em;
-	color: var(--text-muted);
-}
-
-.vaso-source-card {
-	margin-bottom: 6px;
+.vaso-source {
+	margin-bottom: var(--size-4-2);
 	border: 1px solid var(--background-modifier-border);
-	border-radius: 6px;
+	border-radius: var(--radius-m);
 	overflow: hidden;
 }
 
-.vaso-source-header {
+.vaso-source-head {
 	display: flex;
 	align-items: center;
-	gap: 8px;
-	padding: 6px 10px;
+	gap: var(--size-4-2);
+	padding: var(--size-4-2) var(--size-4-3);
 	cursor: pointer;
-	transition: background 0.1s;
 }
 
-.vaso-source-header:hover {
+.vaso-source-head:hover {
 	background: var(--background-modifier-hover);
 }
 
 .vaso-source-name {
-	font-weight: 600;
-	color: var(--text-accent);
-	cursor: pointer;
 	flex: 1;
+	min-width: 0;
+	font-weight: var(--font-semibold);
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
 
-.vaso-source-name:hover {
-	text-decoration: underline;
-}
-
-.vaso-source-badge {
-	font-size: 0.7em;
-	font-weight: 700;
-	padding: 1px 5px;
-	border-radius: 3px;
+.vaso-badge {
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-bold);
+	padding: 0 var(--size-4-1);
+	border-radius: var(--radius-s);
 	flex-shrink: 0;
 }
 
-.vaso-badge-l0 {
-	background: var(--text-accent);
-	color: var(--text-on-accent);
-}
-
-.vaso-badge-deep {
-	background: var(--interactive-accent);
-	color: var(--text-on-accent);
-}
-
-.vaso-badge-broad {
-	background: var(--background-modifier-border);
-	color: var(--text-muted);
-}
+.vaso-badge-l0 { background: var(--interactive-accent); color: var(--text-on-accent); }
+.vaso-badge-l1 { background: var(--background-modifier-border-hover); color: var(--text-normal); }
+.vaso-badge-l2 { background: var(--background-modifier-border); color: var(--text-muted); }
 
 .vaso-source-sim {
-	font-size: 0.8em;
+	font-size: var(--font-ui-smaller);
 	color: var(--text-faint);
 	flex-shrink: 0;
 }
 
-.vaso-source-preview {
-	font-size: 0.85em;
-	color: var(--text-muted);
-	padding: 6px 10px 10px;
-	border-top: 1px solid var(--background-modifier-border);
-	line-height: 1.45;
+.vaso-source-chevron {
+	display: flex;
+	color: var(--text-faint);
+	transition: transform 0.15s;
 }
 
-/* Toggle helper — apply to anything that should hide until expanded. */
-.vaso-collapsed {
+.vaso-source.is-open .vaso-source-chevron {
+	transform: rotate(180deg);
+}
+
+.vaso-source-preview {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	padding: var(--size-4-2) var(--size-4-3) var(--size-4-3);
+	border-top: 1px solid var(--background-modifier-border);
+	line-height: 1.45;
+	user-select: text;
+}
+
+.vaso-hidden {
 	display: none;
+}
+
+/* Bigger tap targets on phones and tablets. */
+.is-mobile .vaso-source-head {
+	padding: var(--size-4-3);
 }
 
 /* ── Settings — Endpoint Cards ──────────────────────────── */
