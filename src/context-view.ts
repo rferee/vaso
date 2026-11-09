@@ -183,6 +183,8 @@ export class VasoContextView extends ItemView {
 
 	private async refresh(force: boolean): Promise<void> {
 		if (this.closed || this.busy) return;
+		// A debounce scheduled before automatic updates were switched off.
+		if (!force && !this.plugin.settings.contextPanelEnabled) return;
 		const file = this.file;
 		if (!file) {
 			this.setActivity("Open a note to see its lore context.");
