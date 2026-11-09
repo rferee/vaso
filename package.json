@@ -10,12 +10,10 @@
 	},
 	"license": "AGPL-3.0-only",
 	"devDependencies": {
-		"@types/node": "^16.11.6",
-		"esbuild": "0.25.5",
-		"tslib": "2.4.0",
-		"typescript": "^5.8.3"
-	},
-	"dependencies": {
-		"obsidian": "latest"
+		"@types/node": "^22.19.0",
+		"esbuild": "0.28.2",
+		"obsidian": "1.14.4",
+		"tslib": "2.9.1",
+		"typescript": "~6.0.3"
 	}
 }

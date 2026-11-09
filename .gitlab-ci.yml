@@ -1,5 +1,5 @@
 default:
-  image: node:20-alpine
+  image: node:24-alpine
 
 stages:
   - build
@@ -11,6 +11,12 @@ variables:
 build:
   stage: build
   script:
+    - |
+      node -e '
+        const pkg = require("./package.json").version;
+        const man = require("./manifest.json").version;
+        if (pkg !== man) { console.error(`package.json ${pkg} != manifest.json ${man}`); process.exit(1); }
+      '
     - npm ci
     - npm run build
   artifacts:
@@ -47,6 +53,13 @@ package:
     - git config user.email "ci@${CI_SERVER_HOST}"
     - git config user.name "GitLab CI"
     - git remote set-url origin "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # Each version is released once; later commits without a version bump
+    # only produce the job artifact.
+    - |
+      if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null; then
+        echo "v${VERSION} is already released; bump package.json and manifest.json to publish."
+        exit 0
+      fi
     - git tag "v${VERSION}"
     - git push origin "v${VERSION}"
     - git tag --force latest
