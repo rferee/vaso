@@ -54,17 +54,13 @@ package:
     - git config user.name "GitLab CI"
     - git remote set-url origin "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     # Each version is released once; later commits without a version bump
-    # only produce the job artifact.
+    # only produce the job artifact. The version tag is pushed last, after the
+    # uploads, so it marks a completed release and a failed run is retried.
     - |
       if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null; then
         echo "v${VERSION} is already released; bump package.json and manifest.json to publish."
         exit 0
       fi
-    - git tag "v${VERSION}"
-    - git push origin "v${VERSION}"
-    - git tag --force latest
-    - git push origin latest --force
-    
     - |
       for asset in "${PACKAGE_NAME}-${VERSION}.zip" "${PACKAGE_NAME}-latest.zip"; do
         echo "Uploading ${asset}"
@@ -72,6 +68,10 @@ package:
              --upload-file "${asset}" \
              "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/${asset}"
       done
+    - git tag --force latest
+    - git push origin latest --force
+    - git tag "v${VERSION}"
+    - git push origin "v${VERSION}"
 
     - echo "Done. Browse downloads at ${CI_PROJECT_URL}/-/packages"
   artifacts:
