@@ -186,6 +186,7 @@ function nodeStream(
 	headers: Record<string, string>,
 	signal?: AbortSignal,
 ): Promise<Reader> {
+	if (!Platform.isDesktopApp) throw new Error("Node streaming is only available on desktop");
 	const mod = (url.startsWith("https:") ? require("https") : require("http")) as typeof NodeHttp;
 
 	return new Promise((resolve, reject) => {

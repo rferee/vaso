@@ -10,7 +10,6 @@ import {
 	consumeOpenAIStream,
 	customParamsFlat,
 	fetchStream,
-	joinUrl,
 	requestJson,
 } from "./http";
 import type { ChatMessage, LLMProvider, ModelEntry } from "./types";

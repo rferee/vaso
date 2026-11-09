@@ -32,7 +32,8 @@ import type { ChatMessage, ChatStats, ChatStreamResult, LLMProvider, ModelInfo, 
 
 interface LMModel {
 	key?: string;
-	type?: "llm" | "embedding" | string;
+	/** "llm", "embedding" or "decision". */
+	type?: string;
 	display_name?: string;
 	publisher?: string;
 	architecture?: string;
@@ -90,10 +91,11 @@ async function consumeNativeStream(
 	let text = "";
 	let reasoning = "";
 	let stats: ChatStats | null = null;
-	let error: string | null = null;
+	// Assigned inside `handle`; an object keeps TypeScript from narrowing it to null.
+	const failure: { message: string | null } = { message: null };
 
 	const handle = (event: string, data: string) => {
-		let d: Record<string, unknown> = {};
+		let d: Record<string, unknown>;
 		try {
 			d = data ? (JSON.parse(data) as Record<string, unknown>) : {};
 		} catch {
@@ -134,7 +136,7 @@ async function consumeNativeStream(
 				break;
 			case "error": {
 				const e = d.error as { message?: unknown } | undefined;
-				error = e?.message ? String(e.message) : data;
+				failure.message = typeof e?.message === "string" ? e.message : data;
 				break;
 			}
 			case "chat.end": {
@@ -172,7 +174,7 @@ async function consumeNativeStream(
 	});
 	for (const ev of parseSSE(buffer + "\n\n").events) handle(ev.event, ev.data);
 
-	if (error && !text) throw new Error(`LM Studio: ${error}`);
+	if (failure.message && !text) throw new Error(`LM Studio: ${failure.message}`);
 	cb.onStatus("done");
 	return { text, stats };
 }

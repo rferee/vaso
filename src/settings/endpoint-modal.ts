@@ -26,6 +26,7 @@ export class EndpointModal extends Modal {
 	private draft: EndpointConfig;
 	private info: ModelInfo | null = null;
 	private infoFor = "";
+	private infoSeq = 0;
 	/** Re-rendered in place when model info arrives, so focus elsewhere isn't lost. */
 	private infoEl: HTMLElement | null = null;
 	private contextEl: HTMLElement | null = null;
@@ -112,6 +113,7 @@ export class EndpointModal extends Modal {
 					.onChange((v) => (d.apiKey = v.trim() || undefined));
 				t.inputEl.type = "password";
 				plainInput(t.inputEl, "text");
+				t.inputEl.addEventListener("blur", () => void this.loadInfo());
 			});
 
 		// ── Model ──
@@ -311,18 +313,23 @@ export class EndpointModal extends Modal {
 		}
 	}
 
-	/** Fetch model details (context length, capabilities) for the current URL + model. */
+	/** Fetch model details (context length, capabilities) for the current server, key and model. */
 	private async loadInfo(): Promise<void> {
 		const d = this.draft;
-		const key = `${d.providerType}|${d.url}|${d.model}`;
+		const key = `${d.providerType}|${d.url}|${d.model}|${d.apiKey ?? ""}`;
 		if (!d.url || !d.model || key === this.infoFor) return;
 		this.infoFor = key;
+		const seq = ++this.infoSeq;
+
+		let info: ModelInfo | null = null;
 		try {
-			this.info = await showModel(d, d.model);
+			info = await showModel({ ...d }, d.model);
 		} catch {
-			this.info = null;
+			info = null;
 		}
-		if (this.infoFor !== key) return;
+		if (seq !== this.infoSeq) return; // a newer request owns the display
+		this.info = info;
+		if (!info) this.infoFor = ""; // let the next blur retry
 		if (this.infoEl) this.renderInfo(this.infoEl);
 		if (this.contextEl) this.renderContextSize(this.contextEl);
 	}

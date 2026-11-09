@@ -1,5 +1,5 @@
 import { Platform, PluginSettingTab, Setting, SettingGroup, debounce } from "obsidian";
-import type { App, Debouncer } from "obsidian";
+import type { App, ButtonComponent, Debouncer } from "obsidian";
 import type VasoPlugin from "../main";
 import type { EndpointConfig, EndpointKind, L0Depth } from "../types";
 import {
@@ -51,7 +51,7 @@ export class VasoSettingTab extends PluginSettingTab {
 		this.section("advanced", (el) => this.renderAdvanced(el));
 
 		this.unsubscribe?.();
-		this.unsubscribe = this.plugin.onIndexChange(() => this.rerender("index"));
+		this.unsubscribe = this.plugin.onIndexChange(() => this.updateIndexStatus());
 	}
 
 	hide(): void {
@@ -219,44 +219,56 @@ export class VasoSettingTab extends PluginSettingTab {
 
 	// ── Index ────────────────────────────────────────────────
 
+	/** Refreshes the index status row in place (progress updates must not rebuild the sliders). */
+	private updateIndexStatus: () => void = () => undefined;
+
+	private renderIndexStatus(row: Setting, update: ButtonComponent, rebuild: ButtonComponent): void {
+		const store = this.plugin.store;
+		const mismatch = store.index ? indexMismatch(store.index, this.s) : null;
+		let status: string;
+		if (store.progress) {
+			const { label, done, total } = store.progress;
+			status = total ? `${label}: ${done}/${total} chunks` : `${label}…`;
+		} else if (!hasIndexScope(this.s)) {
+			status = "Choose at least one folder below.";
+		} else if (mismatch) {
+			status = `${mismatch} Rebuild to use the index again.`;
+		} else if (store.problem) {
+			status = store.problem;
+		} else if (store.chunkCount > 0 && store.index) {
+			status = `${store.chunkCount} chunks from ${store.pageCount} pages · updated ${new Date(store.index.builtAt).toLocaleString()}`;
+		} else {
+			status = "Not built yet.";
+		}
+		row.setDesc(status);
+		const disabled = !!store.progress || !hasIndexScope(this.s);
+		update.setDisabled(disabled);
+		rebuild.setDisabled(disabled);
+		rebuild.buttonEl.toggleClass("mod-cta", !!mismatch || store.needsRebuild);
+	}
+
 	private renderIndex(el: HTMLElement): void {
 		const store = this.plugin.store;
 		const group = new SettingGroup(el).setHeading("Index");
 
 		group.addSetting((row) => {
 			row.setName("Status");
-			const mismatch = store.index ? indexMismatch(store.index, this.s) : null;
-			let status: string;
-			if (store.progress) {
-				const { label, done, total } = store.progress;
-				status = total ? `${label}: ${done}/${total} chunks` : `${label}…`;
-			} else if (!hasIndexScope(this.s)) {
-				status = "Choose at least one folder below.";
-			} else if (mismatch) {
-				status = `${mismatch} Rebuild to use the index again.`;
-			} else if (store.problem) {
-				status = store.problem;
-			} else if (store.chunkCount > 0) {
-				status = `${store.chunkCount} chunks from ${store.pageCount} pages · updated ${new Date(store.index!.builtAt).toLocaleString()}`;
-			} else {
-				status = "Not built yet.";
-			}
-			row.setDesc(status);
-			const busy = !!store.progress;
-			row.addButton((b) =>
-				b
+			let update!: ButtonComponent;
+			let rebuild!: ButtonComponent;
+			row.addButton((b) => {
+				update = b
 					.setButtonText("Update")
 					.setTooltip("Embed new and changed notes")
-					.setDisabled(busy || !hasIndexScope(this.s))
-					.onClick(() => void store.update(true)),
-			);
-			row.addButton((b) => {
-				b.setButtonText("Rebuild")
-					.setTooltip("Embed every note again")
-					.setDisabled(busy || !hasIndexScope(this.s))
-					.onClick(() => void store.rebuild());
-				if (mismatch || store.needsRebuild) b.setCta();
+					.onClick(() => void store.update(true));
 			});
+			row.addButton((b) => {
+				rebuild = b
+					.setButtonText("Rebuild")
+					.setTooltip("Embed every note again")
+					.onClick(() => void store.rebuild());
+			});
+			this.updateIndexStatus = () => this.renderIndexStatus(row, update, rebuild);
+			this.updateIndexStatus();
 		});
 
 		group.addSetting((row) =>
