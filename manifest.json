@@ -2,7 +2,7 @@
 	"id": "vaso",
 	"name": "Vaso",
 	"version": "1.0.0",
-	"minAppVersion": "1.7.2",
+	"minAppVersion": "1.11.0",
 	"description": "AI-powered lore context panel for worldbuilding vaults.",
 	"author": "rferee",
 	"isDesktopOnly": false

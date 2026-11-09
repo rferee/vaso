@@ -11,6 +11,7 @@ import { initLogger, getLogger, destroyLogger } from "./logger";
 export default class VasoPlugin extends Plugin {
 	settings!: VasoSettings;
 	store!: IndexStore;
+	private indexListeners = new Set<() => void>();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -25,7 +26,10 @@ export default class VasoPlugin extends Plugin {
 			this.app,
 			this.manifest.dir ?? "",
 			() => this.settings,
-			() => this.refreshViews(),
+			() => {
+				this.refreshViews();
+				for (const cb of this.indexListeners) cb();
+			},
 		);
 
 		this.addSettingTab(new VasoSettingTab(this.app, this));
@@ -103,6 +107,12 @@ export default class VasoPlugin extends Plugin {
 			maxFileSizeBytes: this.settings.debugLogMaxSizeMB * 1024 * 1024,
 		});
 		this.refreshViews();
+	}
+
+	/** Called whenever the index or its status changes. Returns an unsubscribe function. */
+	onIndexChange(cb: () => void): () => void {
+		this.indexListeners.add(cb);
+		return () => this.indexListeners.delete(cb);
 	}
 
 	// ── Views ─────────────────────────────────────────────────

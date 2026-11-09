@@ -1,427 +1,626 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { Platform, PluginSettingTab, Setting, SettingGroup, debounce } from "obsidian";
+import type { App, Debouncer } from "obsidian";
 import type VasoPlugin from "../main";
-import type { ModelEntry, ModelInfo } from "../llm";
-import { getLogger } from "../logger";
-import type { SettingsContext } from "./shared";
-import { renderEndpointSection } from "./endpoint-card";
+import type { EndpointConfig, EndpointKind, L0Depth } from "../types";
+import {
+	DEFAULT_SYSTEM_PROMPT,
+	DEFAULT_USER_PROMPT_TEMPLATE,
+	PROVIDER_LABELS,
+	createDefaultEndpoint,
+} from "../types";
+import { checkEndpoint } from "../llm";
+import { hasIndexScope, indexMismatch } from "../indexer";
+import { TEMPLATE_VARIABLES } from "../prompt-builder";
+import { errorMessage } from "../errors";
+import { EndpointModal } from "./endpoint-modal";
+import { PromptModal } from "./prompt-modal";
+import { ConfirmModal, FolderSuggestModal } from "./suggest";
+
+type SectionId = "embedding" | "inference" | "index" | "prompt" | "retrieval" | "panel" | "advanced";
 
 export class VasoSettingTab extends PluginSettingTab {
 	plugin: VasoPlugin;
-
-	/** Cached model lists per URL — survives re-renders within the open tab. */
-	private modelCache = new Map<string, ModelEntry[]>();
-	/** Cached model info per "url::model" key. */
-	private modelInfoCache = new Map<string, ModelInfo>();
+	private sections = new Map<SectionId, { el: HTMLElement; render: (el: HTMLElement) => void }>();
+	/** Test results shown under endpoint rows, by endpoint id. */
+	private testResults = new Map<string, { ok: boolean; text: string }>();
+	private saveSoon: Debouncer<[], void>;
+	private unsubscribe: (() => void) | null = null;
 
 	constructor(app: App, plugin: VasoPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+		this.saveSoon = debounce(() => void this.plugin.saveSettings(), 400, true);
 	}
 
-	private buildContext(): SettingsContext {
-		return {
-			plugin: this.plugin,
-			modelCache: this.modelCache,
-			modelInfoCache: this.modelInfoCache,
-			refresh: () => this.display(),
-		};
+	private get s() {
+		return this.plugin.settings;
 	}
 
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		const ctx = this.buildContext();
+		containerEl.addClass("vaso-settings");
+		this.sections.clear();
 
-		// ── Endpoint sections ───────────────────────────────
-		renderEndpointSection(
-			ctx,
-			containerEl,
-			"Embedding Endpoints",
-			"Tried in order until one responds. Used for generating vector embeddings.",
-			"embedding",
+		this.section("embedding", (el) => this.renderEndpoints(el, "embedding"));
+		this.section("inference", (el) => this.renderEndpoints(el, "inference"));
+		this.section("index", (el) => this.renderIndex(el));
+		this.section("prompt", (el) => this.renderPrompt(el));
+		this.section("retrieval", (el) => this.renderRetrieval(el));
+		this.section("panel", (el) => this.renderPanel(el));
+		this.section("advanced", (el) => this.renderAdvanced(el));
+
+		this.unsubscribe?.();
+		this.unsubscribe = this.plugin.onIndexChange(() => this.rerender("index"));
+	}
+
+	hide(): void {
+		this.saveSoon.run();
+		this.unsubscribe?.();
+		this.unsubscribe = null;
+	}
+
+	private section(id: SectionId, render: (el: HTMLElement) => void): void {
+		const el = this.containerEl.createDiv(`vaso-settings-section vaso-settings-${id}`);
+		this.sections.set(id, { el, render });
+		render(el);
+	}
+
+	/** Re-render one section in place (keeps the scroll position). */
+	private rerender(id: SectionId): void {
+		const sec = this.sections.get(id);
+		if (!sec) return;
+		sec.el.empty();
+		sec.render(sec.el);
+	}
+
+	/** Re-render a section once a slider is released (not while it's being dragged). */
+	private rerenderOnRelease(sliderEl: HTMLInputElement, id: SectionId): void {
+		sliderEl.addEventListener("change", () => {
+			this.saveSoon.run();
+			this.rerender(id);
+		});
+	}
+
+	private async saveNow(...rerender: SectionId[]): Promise<void> {
+		this.saveSoon.cancel();
+		await this.plugin.saveSettings();
+		for (const id of rerender) this.rerender(id);
+	}
+
+	// ── Endpoints ────────────────────────────────────────────
+
+	private renderEndpoints(el: HTMLElement, type: EndpointKind): void {
+		const list = type === "embedding" ? this.s.embeddingEndpoints : this.s.inferenceEndpoints;
+		const group = new SettingGroup(el).setHeading(type === "embedding" ? "Embedding endpoints" : "Inference endpoints");
+
+		group.addSetting((row) =>
+			row.setDesc(
+				type === "embedding"
+					? "Turn notes into vectors for search. Tried in order; the first reachable one is used. Use the same model on all of them: switching models means rebuilding the index."
+					: "Write the lore summary. Tried in order; the first reachable one is used.",
+			),
 		);
-		renderEndpointSection(
-			ctx,
-			containerEl,
-			"Inference Endpoints",
-			"Tried in order until one responds. Used for LLM chat synthesis.",
-			"inference",
-		);
 
-		// ── System Prompt ───────────────────────────────────
-		containerEl.createEl("h3", { text: "System prompt" });
-
-		new Setting(containerEl)
-			.setName("LLM system prompt")
-			.setDesc(
-				"Sent as the system message when synthesizing lore context. Use this to control the style, format, and behaviour of the output.",
-			)
-			.addTextArea((text) => {
-				text.setPlaceholder("You are a lore assistant…")
-					.setValue(this.plugin.settings.systemPrompt)
-					.onChange(async (value) => {
-						this.plugin.settings.systemPrompt = value;
-						await this.plugin.saveSettings();
-					});
-				text.inputEl.rows = 8;
-				text.inputEl.style.width = "100%";
-				text.inputEl.style.fontFamily = "var(--font-monospace)";
-				text.inputEl.style.fontSize = "0.85em";
-				return text;
-			});
-
-		new Setting(containerEl)
-			.setName("Writing context (words)")
-			.setDesc(
-				"Number of words from the current note to send as writing context. 0 = send the full file.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 2000, 50)
-					.setValue(this.plugin.settings.contextWords)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.contextWords = value;
-						await this.plugin.saveSettings();
-					}),
+		if (Platform.isMobile && list.every((ep) => /\/\/(localhost|127\.0\.0\.1)\b/.test(ep.url))) {
+			group.addSetting((row) =>
+				row
+					.setDesc(
+						"On this device, localhost is the device itself. Add an endpoint with your computer's LAN or Tailscale address (HTTPS recommended), or a hosted provider.",
+					)
+					.setClass("vaso-mobile-hint"),
 			);
-
-		new Setting(containerEl)
-			.setName("Strip frontmatter")
-			.setDesc(
-				"Remove YAML frontmatter from the current note and source pages before sending to the LLM.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.stripFrontmatter)
-					.onChange(async (value) => {
-						this.plugin.settings.stripFrontmatter = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Strip callouts")
-			.setDesc(
-				"Remove Obsidian callout blocks (> [!type]) from content before sending to the LLM, except whitelisted types.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.stripCallouts)
-					.onChange(async (value) => {
-						this.plugin.settings.stripCallouts = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Callout whitelist")
-			.setDesc(
-				'Callout types to keep when stripping. One per line, case-insensitive (e.g. "example").',
-			)
-			.addTextArea((text) => {
-				text.setPlaceholder("example")
-					.setValue(this.plugin.settings.calloutWhitelist.join("\n"))
-					.onChange(async (value) => {
-						this.plugin.settings.calloutWhitelist = value
-							.split("\n")
-							.map((s) => s.trim())
-							.filter((s) => s.length > 0);
-						await this.plugin.saveSettings();
-					});
-				text.inputEl.rows = 3;
-				text.inputEl.style.width = "100%";
-				text.inputEl.style.fontFamily = "var(--font-monospace)";
-				text.inputEl.style.fontSize = "0.85em";
-				return text;
-			});
-
-		// ── Retrieval Tuning ────────────────────────────────
-		containerEl.createEl("h3", { text: "Retrieval tuning" });
-
-		new Setting(containerEl)
-			.setName("L0 — paragraph focus (chunks)")
-			.setDesc(
-				"Number of chunks most similar to the current paragraph. Only active when the cursor position is available. Set to 0 to disable.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 10, 1)
-					.setValue(this.plugin.settings.l0Chunks)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.l0Chunks = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("L0 include neighbor paragraphs")
-			.setDesc(
-				"When on, the L0 query embeds the cursor paragraph plus one before and one after. When off, only the cursor paragraph is embedded.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.l0IncludeNeighborParagraphs)
-					.onChange(async (value) => {
-						this.plugin.settings.l0IncludeNeighborParagraphs = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("L0 match depth")
-			.setDesc(
-				"How much content to include per L0 match. Chunk = matched chunk only. Nearby = matched chunk ± surrounding chunks. Page = full source page.",
-			)
-			.addDropdown((dropdown) => {
-				dropdown
-					.addOptions({
-						chunk: "Chunk only",
-						nearby: "Nearby chunks",
-						page: "Full page",
-					})
-					.setValue(this.plugin.settings.l0Depth)
-					.onChange(async (value) => {
-						this.plugin.settings.l0Depth = value as "chunk" | "nearby" | "page";
-						await this.plugin.saveSettings();
-						this.display();
-					});
-			});
-
-		if (this.plugin.settings.l0Depth === "nearby") {
-			new Setting(containerEl)
-				.setName("L0 nearby radius")
-				.setDesc(
-					"How many chunks before and after each L0 match to include.",
-				)
-				.addSlider((slider) =>
-					slider
-						.setLimits(1, 5, 1)
-						.setValue(this.plugin.settings.l0NearbyRadius)
-						.setDynamicTooltip()
-						.onChange(async (value) => {
-							this.plugin.settings.l0NearbyRadius = value;
-							await this.plugin.saveSettings();
-						}),
-				);
 		}
 
-		new Setting(containerEl)
-			.setName("L1 — whole-note relevance (full pages)")
-			.setDesc(
-				"Number of top-matching pages (by max similarity across all note chunks) whose full content is sent to the LLM.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 10, 1)
-					.setValue(this.plugin.settings.l1Chunks)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.l1Chunks = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+		list.forEach((ep, i) => group.addSetting((row) => this.renderEndpointRow(row, ep, i, list, type)));
 
-		new Setting(containerEl)
-			.setName("L2 — broad context (chunks only)")
-			.setDesc(
-				"Number of additional chunks from pages not already in L0 or L1.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 15, 1)
-					.setValue(this.plugin.settings.l2Chunks)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.l2Chunks = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+		group.addSetting((row) =>
+			row.addButton((b) =>
+				b
+					.setButtonText("Add endpoint")
+					.setCta()
+					.onClick(() =>
+						new EndpointModal(this.app, createDefaultEndpoint(type), true, (saved) => {
+							list.push(saved);
+							void this.saveNow(type, "index");
+						}).open(),
+					),
+			),
+		);
+	}
 
-		new Setting(containerEl)
-			.setName("L1 max page size (words)")
-			.setDesc("Truncate full pages beyond this word count.")
-			.addSlider((slider) =>
-				slider
-					.setLimits(200, 3000, 100)
-					.setValue(this.plugin.settings.l1MaxPageWords)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.l1MaxPageWords = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+	private renderEndpointRow(
+		row: Setting,
+		ep: EndpointConfig,
+		i: number,
+		list: EndpointConfig[],
+		type: EndpointKind,
+	): void {
+		const host = ep.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+		row.setName(`${i + 1}. ${ep.name || PROVIDER_LABELS[ep.providerType]}`);
+		row.setDesc(
+			createFragment((f) => {
+				f.appendText(`${PROVIDER_LABELS[ep.providerType]} · ${ep.model || "no model"} · ${host || "no URL"}`);
+				const result = this.testResults.get(ep.id);
+				if (result) {
+					f.createEl("br");
+					f.createSpan({ cls: result.ok ? "vaso-ok" : "vaso-error", text: result.text });
+				}
+			}),
+		);
 
-		// ── Chunking ────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Chunking" });
-
-		new Setting(containerEl)
-			.setName("Chunk size (words)")
-			.setDesc("Target number of words per chunk when indexing.")
-			.addSlider((slider) =>
-				slider
-					.setLimits(100, 1000, 50)
-					.setValue(this.plugin.settings.chunkSize)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.chunkSize = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Chunk overlap (words)")
-			.setDesc("Overlap between adjacent chunks for continuity.")
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 200, 10)
-					.setValue(this.plugin.settings.chunkOverlap)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.chunkOverlap = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		// ── Index Scope ─────────────────────────────────────
-		containerEl.createEl("h3", { text: "Index scope" });
-
-		new Setting(containerEl)
-			.setName("Index root files")
-			.setDesc(
-				"Include files in the vault root (not inside any subdirectory).",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.indexRoot)
-					.onChange(async (value) => {
-						this.plugin.settings.indexRoot = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Indexed directories")
-			.setDesc(
-				"Only files inside these directories will be indexed. One directory per line. Rebuild index after changing.",
-			)
-			.addTextArea((text) => {
-				text.setPlaceholder("Geography & Regions\nReligion & Lore")
-					.setValue(this.plugin.settings.indexedDirectories.join("\n"))
-					.onChange(async (value) => {
-						this.plugin.settings.indexedDirectories = value
-							.split("\n")
-							.map((d) => d.trim())
-							.filter((d) => d.length > 0);
-						await this.plugin.saveSettings();
+		row.addExtraButton((b) =>
+			b
+				.setIcon("activity")
+				.setTooltip("Test connection")
+				.onClick(async () => {
+					this.testResults.set(ep.id, { ok: true, text: "Testing…" });
+					this.rerender(type);
+					try {
+						const t0 = Date.now();
+						await checkEndpoint(ep);
+						this.testResults.set(ep.id, { ok: true, text: `✓ Reachable (${Date.now() - t0} ms)` });
+					} catch (err) {
+						this.testResults.set(ep.id, { ok: false, text: `✗ ${errorMessage(err)}` });
+					}
+					this.rerender(type);
+				}),
+		);
+		row.addExtraButton((b) =>
+			b
+				.setIcon("pencil")
+				.setTooltip("Edit")
+				.onClick(() =>
+					new EndpointModal(this.app, ep, false, (saved) => {
+						list[i] = saved;
+						this.testResults.delete(ep.id);
+						void this.saveNow(type, "index");
+					}).open(),
+				),
+		);
+		if (list.length > 1) {
+			row.addExtraButton((b) => {
+				b.setIcon("arrow-up")
+					.setTooltip("Try earlier")
+					.onClick(() => {
+						[list[i - 1], list[i]] = [list[i]!, list[i - 1]!];
+						void this.saveNow(type);
 					});
-				text.inputEl.rows = 6;
-				text.inputEl.style.width = "100%";
-				text.inputEl.style.fontFamily = "var(--font-monospace)";
-				text.inputEl.style.fontSize = "0.85em";
-				return text;
+				b.setDisabled(i === 0);
+			});
+			row.addExtraButton((b) => {
+				b.setIcon("arrow-down")
+					.setTooltip("Try later")
+					.onClick(() => {
+						[list[i + 1], list[i]] = [list[i]!, list[i + 1]!];
+						void this.saveNow(type);
+					});
+				b.setDisabled(i === list.length - 1);
+			});
+		}
+		row.addExtraButton((b) =>
+			b
+				.setIcon("trash-2")
+				.setTooltip("Remove")
+				.onClick(() =>
+					new ConfirmModal(
+						this.app,
+						"Remove endpoint?",
+						`"${ep.name || ep.url}" will be removed from the ${type} endpoints.`,
+						"Remove",
+						() => {
+							list.splice(i, 1);
+							void this.saveNow(type, "index");
+						},
+					).open(),
+				),
+		);
+	}
+
+	// ── Index ────────────────────────────────────────────────
+
+	private renderIndex(el: HTMLElement): void {
+		const store = this.plugin.store;
+		const group = new SettingGroup(el).setHeading("Index");
+
+		group.addSetting((row) => {
+			row.setName("Status");
+			const mismatch = store.index ? indexMismatch(store.index, this.s) : null;
+			let status: string;
+			if (store.progress) {
+				const { label, done, total } = store.progress;
+				status = total ? `${label}: ${done}/${total} chunks` : `${label}…`;
+			} else if (!hasIndexScope(this.s)) {
+				status = "Choose at least one folder below.";
+			} else if (mismatch) {
+				status = `${mismatch} Rebuild to use the index again.`;
+			} else if (store.problem) {
+				status = store.problem;
+			} else if (store.chunkCount > 0) {
+				status = `${store.chunkCount} chunks from ${store.pageCount} pages · updated ${new Date(store.index!.builtAt).toLocaleString()}`;
+			} else {
+				status = "Not built yet.";
+			}
+			row.setDesc(status);
+			const busy = !!store.progress;
+			row.addButton((b) =>
+				b
+					.setButtonText("Update")
+					.setTooltip("Embed new and changed notes")
+					.setDisabled(busy || !hasIndexScope(this.s))
+					.onClick(() => void store.update(true)),
+			);
+			row.addButton((b) => {
+				b.setButtonText("Rebuild")
+					.setTooltip("Embed every note again")
+					.setDisabled(busy || !hasIndexScope(this.s))
+					.onClick(() => void store.rebuild());
+				if (mismatch || store.needsRebuild) b.setCta();
+			});
+		});
+
+		group.addSetting((row) =>
+			row
+				.setName("Notes in the vault root")
+				.setDesc("Also index notes that aren't in any folder.")
+				.addToggle((t) =>
+					t.setValue(this.s.indexRoot).onChange((v) => {
+						this.s.indexRoot = v;
+						void this.saveNow("index");
+					}),
+				),
+		);
+
+		group.addSetting((row) =>
+			row
+				.setName("Folders")
+				.setDesc("Notes in these folders (and their subfolders) are indexed.")
+				.addButton((b) =>
+					b.setButtonText("Add folder").onClick(() =>
+						new FolderSuggestModal(this.app, new Set(this.s.indexedDirectories), (path) => {
+							this.s.indexedDirectories.push(path);
+							void this.saveNow("index");
+						}).open(),
+					),
+				),
+		);
+		this.s.indexedDirectories.forEach((dir, i) =>
+			group.addSetting((row) => {
+				row.setClass("vaso-folder-row").setName(dir);
+				if (!this.app.vault.getFolderByPath(dir.replace(/\/+$/, ""))) row.setDesc("Folder not found");
+				row.addExtraButton((b) =>
+					b
+						.setIcon("x")
+						.setTooltip("Stop indexing this folder")
+						.onClick(() => {
+							this.s.indexedDirectories.splice(i, 1);
+							void this.saveNow("index");
+						}),
+				);
+			}),
+		);
+
+		group.addSetting((row) =>
+			row
+				.setName("Chunk size (words)")
+				.setDesc("Notes are split into pieces of about this many words. Changing it requires a rebuild.")
+				.addSlider((sl) =>
+					sl
+						.setLimits(100, 1000, 50)
+						.setValue(this.s.chunkSize)
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.chunkSize = v;
+							this.s.chunkOverlap = Math.min(this.s.chunkOverlap, v - 1);
+							this.saveSoon();
+						})
+						.then((c) => this.rerenderOnRelease(c.sliderEl, "index")),
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Chunk overlap (words)")
+				.setDesc("Words shared by neighbouring pieces, so ideas aren't cut in half. Changing it requires a rebuild.")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0, 200, 10)
+						.setValue(this.s.chunkOverlap)
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.chunkOverlap = Math.min(v, this.s.chunkSize - 1);
+							this.saveSoon();
+						})
+						.then((c) => this.rerenderOnRelease(c.sliderEl, "index")),
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Re-index edited notes after (seconds)")
+				.setDesc("Edited notes are re-embedded after this pause. 0 turns automatic updates off (use Update).")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0, 60, 1)
+						.setValue(Math.round(this.s.indexDebounceMs / 1000))
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.indexDebounceMs = v * 1000;
+							this.saveSoon();
+						}),
+				),
+		);
+	}
+
+	// ── Prompt ───────────────────────────────────────────────
+
+	private renderPrompt(el: HTMLElement): void {
+		const group = new SettingGroup(el).setHeading("Prompt");
+		const preview = (text: string, def: string) =>
+			createFragment((f) => {
+				if (text === def) f.createSpan({ cls: "vaso-tag", text: "Default" });
+				else f.createSpan({ cls: "vaso-tag is-custom", text: "Customised" });
+				f.createDiv({ cls: "vaso-prompt-preview", text: text.trim().slice(0, 160) + (text.length > 160 ? "…" : "") });
 			});
 
-		// ── Behaviour ───────────────────────────────────────
-		containerEl.createEl("h3", { text: "Behaviour" });
+		group.addSetting((row) =>
+			row
+				.setName("System prompt")
+				.setDesc(preview(this.s.systemPrompt, DEFAULT_SYSTEM_PROMPT))
+				.addButton((b) =>
+					b.setButtonText("Edit").onClick(() =>
+						new PromptModal(this.app, {
+							title: "System prompt",
+							description: "Instructions for the model: what to look for and how to format the answer.",
+							value: this.s.systemPrompt,
+							defaultValue: DEFAULT_SYSTEM_PROMPT,
+							onSave: (v) => {
+								this.s.systemPrompt = v;
+								void this.saveNow("prompt");
+							},
+						}).open(),
+					),
+				),
+		);
 
-		new Setting(containerEl)
-			.setName("Debounce (ms)")
-			.setDesc(
-				"How long to wait after you stop typing before refreshing context.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(500, 10000, 250)
-					.setValue(this.plugin.settings.debounceMs)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.debounceMs = value;
-						await this.plugin.saveSettings();
+		group.addSetting((row) =>
+			row
+				.setName("Message template")
+				.setDesc(preview(this.s.userPromptTemplate, DEFAULT_USER_PROMPT_TEMPLATE))
+				.addButton((b) =>
+					b.setButtonText("Edit").onClick(() =>
+						new PromptModal(this.app, {
+							title: "Message template",
+							description: "How your writing and the matched lore are laid out in the message sent with the system prompt.",
+							value: this.s.userPromptTemplate,
+							defaultValue: DEFAULT_USER_PROMPT_TEMPLATE,
+							variables: TEMPLATE_VARIABLES,
+							onSave: (v) => {
+								this.s.userPromptTemplate = v.trim() ? v : DEFAULT_USER_PROMPT_TEMPLATE;
+								void this.saveNow("prompt");
+							},
+						}).open(),
+					),
+				),
+		);
+
+		group.addSetting((row) =>
+			row
+				.setName("Writing context (words)")
+				.setDesc("How much of the note you're writing is sent: the last N words. 0 sends the whole note.")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0, 2000, 50)
+						.setValue(this.s.contextWords)
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.contextWords = v;
+							this.saveSoon();
+						}),
+				),
+		);
+
+		group.addSetting((row) =>
+			row
+				.setName("Leave out frontmatter")
+				.setDesc("Strip YAML frontmatter from notes. Changing it requires a rebuild.")
+				.addToggle((t) =>
+					t.setValue(this.s.stripFrontmatter).onChange((v) => {
+						this.s.stripFrontmatter = v;
+						void this.saveNow("index");
+					}),
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Leave out callouts")
+				.setDesc("Strip > [!type] callout blocks from notes. Changing it requires a rebuild.")
+				.addToggle((t) =>
+					t.setValue(this.s.stripCallouts).onChange((v) => {
+						this.s.stripCallouts = v;
+						void this.saveNow("prompt", "index");
+					}),
+				),
+		);
+		if (this.s.stripCallouts) {
+			group.addSetting((row) =>
+				row
+					.setName("Keep these callout types")
+					.setDesc("Comma-separated, e.g. example, quote.")
+					.addText((t) => {
+						t.setPlaceholder("example")
+							.setValue(this.s.calloutWhitelist.join(", "))
+							.onChange((v) => {
+								this.s.calloutWhitelist = v.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+								this.saveSoon();
+							});
+						t.inputEl.addEventListener("blur", () => this.rerender("index"));
+						t.inputEl.autocapitalize = "off";
 					}),
 			);
+		}
+	}
 
-		new Setting(containerEl)
-			.setName("Note switch debounce (ms)")
-			.setDesc(
-				"How long to wait after switching notes before refreshing context. Prevents rapid-fire LLM calls when clicking through notes.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(500, 15000, 500)
-					.setValue(this.plugin.settings.noteSwitchDebounceMs)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.noteSwitchDebounceMs = value;
-						await this.plugin.saveSettings();
-					}),
+	// ── Retrieval ────────────────────────────────────────────
+
+	private renderRetrieval(el: HTMLElement): void {
+		const group = new SettingGroup(el).setHeading("What gets retrieved");
+		const slider = (name: string, desc: string, min: number, max: number, step: number, get: () => number, set: (v: number) => void) =>
+			group.addSetting((row) =>
+				row
+					.setName(name)
+					.setDesc(desc)
+					.addSlider((sl) =>
+						sl
+							.setLimits(min, max, step)
+							.setValue(get())
+							.setDynamicTooltip()
+							.onChange((v) => {
+								set(v);
+								this.saveSoon();
+							}),
+					),
 			);
 
-		new Setting(containerEl)
-			.setName("Index auto-update debounce (ms)")
-			.setDesc(
-				"How long to wait after a file changes before re-indexing it. Set to 0 to disable auto-updates (manual rebuild only).",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 30000, 1000)
-					.setValue(this.plugin.settings.indexDebounceMs)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.indexDebounceMs = value;
-						await this.plugin.saveSettings();
+		slider(
+			"Paragraph matches (L0)",
+			"Excerpts most similar to the paragraph you're editing. 0 turns this off.",
+			0, 10, 1,
+			() => this.s.l0Chunks,
+			(v) => (this.s.l0Chunks = v),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Include neighbouring paragraphs")
+				.setDesc("Match against the paragraph before and after the cursor too.")
+				.addToggle((t) =>
+					t.setValue(this.s.l0IncludeNeighborParagraphs).onChange((v) => {
+						this.s.l0IncludeNeighborParagraphs = v;
+						this.saveSoon();
 					}),
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Paragraph match detail")
+				.setDesc("How much of each paragraph match is sent.")
+				.addDropdown((dd) =>
+					dd
+						.addOptions({ chunk: "The excerpt", nearby: "Excerpt and its neighbours", page: "The whole page" })
+						.setValue(this.s.l0Depth)
+						.onChange((v) => {
+							this.s.l0Depth = v as L0Depth;
+							void this.saveNow("retrieval");
+						}),
+				),
+		);
+		if (this.s.l0Depth === "nearby") {
+			slider(
+				"Neighbouring excerpts",
+				"How many excerpts before and after each match are included.",
+				1, 5, 1,
+				() => this.s.l0NearbyRadius,
+				(v) => (this.s.l0NearbyRadius = v),
 			);
+		}
+		slider(
+			"Related pages (L1)",
+			"Pages most similar to the whole note; sent in full (up to the word limit).",
+			0, 10, 1,
+			() => this.s.l1Chunks,
+			(v) => (this.s.l1Chunks = v),
+		);
+		slider(
+			"Extra excerpts (L2)",
+			"Further excerpts from pages not already included.",
+			0, 15, 1,
+			() => this.s.l2Chunks,
+			(v) => (this.s.l2Chunks = v),
+		);
+		slider(
+			"Word limit per page",
+			"Full pages are cut after this many words.",
+			200, 3000, 100,
+			() => this.s.l1MaxPageWords,
+			(v) => (this.s.l1MaxPageWords = v),
+		);
+	}
 
-		new Setting(containerEl)
-			.setName("Enable context panel")
-			.setDesc("Show the AI-powered lore context sidebar.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.contextPanelEnabled)
-					.onChange(async (value) => {
-						this.plugin.settings.contextPanelEnabled = value;
-						await this.plugin.saveSettings();
+	// ── Panel ────────────────────────────────────────────────
+
+	private renderPanel(el: HTMLElement): void {
+		const group = new SettingGroup(el).setHeading("Lore panel");
+		group.addSetting((row) =>
+			row
+				.setName("Update the panel automatically")
+				.setDesc("When off, the panel stays as it is until you tap refresh.")
+				.addToggle((t) =>
+					t.setValue(this.s.contextPanelEnabled).onChange((v) => {
+						this.s.contextPanelEnabled = v;
+						this.saveSoon();
 					}),
-			);
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Refresh after typing pauses (seconds)")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0.5, 10, 0.5)
+						.setValue(this.s.debounceMs / 1000)
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.debounceMs = Math.round(v * 1000);
+							this.saveSoon();
+						}),
+				),
+		);
+		group.addSetting((row) =>
+			row
+				.setName("Refresh after switching notes (seconds)")
+				.setDesc("Avoids a request for every note you click through.")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0.5, 15, 0.5)
+						.setValue(this.s.noteSwitchDebounceMs / 1000)
+						.setDynamicTooltip()
+						.onChange((v) => {
+							this.s.noteSwitchDebounceMs = Math.round(v * 1000);
+							this.saveSoon();
+						}),
+				),
+		);
+	}
 
-		// ── Debug ───────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Debug" });
+	// ── Advanced ─────────────────────────────────────────────
 
-		new Setting(containerEl)
-			.setName("Enable debug logging")
-			.setDesc(
-				"Write verbose debug logs to vaso-debug.log in the plugin folder. " +
-				"Useful for diagnosing search quality, embedding, and LLM issues.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.debugLogging)
-					.onChange(async (value) => {
-						this.plugin.settings.debugLogging = value;
-						await this.plugin.saveSettings();
-						getLogger().updateConfig({ enabled: value });
+	private renderAdvanced(el: HTMLElement): void {
+		const group = new SettingGroup(el).setHeading("Troubleshooting");
+		group.addSetting((row) =>
+			row
+				.setName("Debug log")
+				.setDesc("Write detailed logs (search scores, prompts, server events) to vaso-debug.log in the plugin folder.")
+				.addToggle((t) =>
+					t.setValue(this.s.debugLogging).onChange((v) => {
+						this.s.debugLogging = v;
+						void this.saveNow("advanced");
 					}),
+				),
+		);
+		if (this.s.debugLogging) {
+			group.addSetting((row) =>
+				row
+					.setName("Log size limit (MB)")
+					.setDesc("The log starts over once it's bigger than this.")
+					.addSlider((sl) =>
+						sl
+							.setLimits(1, 10, 1)
+							.setValue(this.s.debugLogMaxSizeMB)
+							.setDynamicTooltip()
+							.onChange((v) => {
+								this.s.debugLogMaxSizeMB = v;
+								this.saveSoon();
+							}),
+					),
 			);
-
-		new Setting(containerEl)
-			.setName("Max log file size (MB)")
-			.setDesc(
-				"When the log file exceeds this size, it is deleted and a fresh one starts.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(1, 10, 1)
-					.setValue(this.plugin.settings.debugLogMaxSizeMB)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.debugLogMaxSizeMB = value;
-						await this.plugin.saveSettings();
-						getLogger().updateConfig({
-							maxFileSizeBytes: value * 1024 * 1024,
-						});
-					}),
-			);
+		}
 	}
 }

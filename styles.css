@@ -256,296 +256,167 @@
 	padding: var(--size-4-3);
 }
 
-/* ── Settings — Endpoint Cards ──────────────────────────── */
+/* ── Settings ─────────────────────────────────────── */
 
-.vaso-ep-section {
-	margin-bottom: 24px;
-}
+.vaso-settings .vaso-ok { color: var(--text-success); }
+.vaso-settings .vaso-error { color: var(--text-error); }
 
-.vaso-ep-section-header {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 12px;
-}
-
-.vaso-ep-section-header h3 {
-	margin: 0;
-}
-
-.vaso-ep-section-desc {
-	margin-top: 0 !important;
-	margin-bottom: 12px !important;
-}
-
-.vaso-ep-add-btn {
-	font-size: 0.85em;
-	white-space: nowrap;
-}
-
-.vaso-ep-empty {
-	color: var(--text-faint);
-	font-style: italic;
-	font-size: 0.9em;
-}
-
-.vaso-ep-card {
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 8px;
-	padding: 12px;
-	margin-bottom: 10px;
-	background: var(--background-secondary);
-}
-
-.vaso-ep-card .setting-item {
-	border-top: none;
-	padding: 6px 0;
-}
-
-.vaso-ep-card-header {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	margin-bottom: 8px;
-	padding-bottom: 8px;
-	border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.vaso-ep-priority {
-	font-weight: 700;
-	font-size: 0.85em;
-	color: var(--text-accent);
-	background: var(--background-primary);
-	padding: 2px 7px;
-	border-radius: 4px;
-	flex-shrink: 0;
-}
-
-.vaso-ep-name-input {
-	flex: 1;
-	font-size: 0.95em;
-	font-weight: 600;
-	background: transparent;
-	border: 1px solid transparent;
-	border-radius: 4px;
-	padding: 3px 6px;
-	color: var(--text-normal);
-}
-
-.vaso-ep-name-input:hover,
-.vaso-ep-name-input:focus {
-	border-color: var(--background-modifier-border);
-	background: var(--background-primary);
-}
-
-.vaso-ep-card-btns {
-	display: flex;
-	gap: 4px;
-	flex-shrink: 0;
-}
-
-.vaso-ep-btn {
-	font-size: 0.85em;
-	padding: 2px 8px;
-	cursor: pointer;
-	border-radius: 4px;
-}
-
-.vaso-ep-btn-danger {
-	color: var(--text-error);
-}
-
-.vaso-ep-btn-small {
-	padding: 1px 6px;
-	font-size: 0.8em;
-}
-
-/* ── Custom Parameters ──────────────────────────────────── */
-
-.vaso-ep-custom-header {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	margin-top: 8px;
-	padding-top: 8px;
-	border-top: 1px solid var(--background-modifier-border);
-}
-
-.vaso-ep-custom-title {
-	font-size: 0.85em;
+.vaso-tag {
+	display: inline-block;
+	font-size: var(--font-ui-smaller);
+	padding: 0 var(--size-4-1);
+	border-radius: var(--radius-s);
+	background: var(--background-modifier-border);
 	color: var(--text-muted);
-	font-weight: 600;
 }
 
-.vaso-ep-custom-params {
-	margin-top: 6px;
+.vaso-tag.is-custom {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
 }
 
-.vaso-ep-custom-hint {
-	font-size: 0.8em;
+.vaso-prompt-preview {
+	margin-top: var(--size-4-1);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
 	color: var(--text-faint);
-	font-style: italic;
+	white-space: pre-wrap;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
 }
 
-.vaso-ep-param-row {
-	display: flex;
-	gap: 6px;
-	align-items: center;
-	margin-bottom: 4px;
+.vaso-mobile-hint .setting-item-description {
+	color: var(--text-warning);
 }
 
-.vaso-ep-param-key,
-.vaso-ep-param-val {
-	flex: 1;
-	font-size: 0.85em;
+.vaso-folder-row .setting-item-name {
 	font-family: var(--font-monospace);
-	padding: 3px 6px;
-	border-radius: 4px;
-	border: 1px solid var(--background-modifier-border);
-	background: var(--background-primary);
-	color: var(--text-normal);
+	font-size: var(--font-ui-small);
 }
 
-.vaso-ep-param-key {
-	max-width: 40%;
+/* ── Endpoint modal ───────────────────────────────── */
+
+.vaso-endpoint-modal .setting-item-control input[type="text"],
+.vaso-endpoint-modal .setting-item-control input[type="password"] {
+	width: 100%;
+	min-width: 12em;
 }
 
-/* ── Model Selector ────────────────────────────────────── */
-
-.vaso-model-selector {
-	padding: 6px 0;
+.vaso-param-row .setting-item-info {
+	display: none;
 }
 
-.vaso-model-row {
-	display: flex;
-	align-items: center;
-	gap: 8px;
+.vaso-param-row .setting-item-control {
+	width: 100%;
+	flex-wrap: nowrap;
 }
 
-.vaso-model-input {
-	flex: 1;
-	font-size: 0.9em;
+.vaso-param-row .setting-item-control input {
+	min-width: 0;
 	font-family: var(--font-monospace);
-	padding: 5px 8px;
-	border-radius: 4px;
-	border: 1px solid var(--background-modifier-border);
-	background: var(--background-primary);
-	color: var(--text-normal);
 }
 
-.vaso-model-input:focus {
-	border-color: var(--interactive-accent);
-	outline: none;
+.vaso-modal-footer {
+	position: sticky;
+	bottom: 0;
+	background: var(--modal-background, var(--background-primary));
+	border-top: 1px solid var(--background-modifier-border);
+	margin-top: var(--size-4-2);
 }
 
-.vaso-model-load-btn {
-	font-size: 0.82em;
-	padding: 4px 10px;
-	cursor: pointer;
-	border-radius: 4px;
-	white-space: nowrap;
-	flex-shrink: 0;
-}
-
-.vaso-model-load-btn:disabled {
-	opacity: 0.5;
-	cursor: default;
-}
-
-/* ── Model Info Badges ─────────────────────────────────── */
+.vaso-modal-footer .setting-item-description.mod-success { color: var(--text-success); }
+.vaso-modal-footer .setting-item-description.mod-warning { color: var(--text-error); }
 
 .vaso-model-info {
-	margin-top: 6px;
+	margin: 0 0 var(--size-4-2);
 }
 
-.vaso-model-info-loading,
-.vaso-model-info-error {
-	font-size: 0.8em;
-	color: var(--text-faint);
-	font-style: italic;
-}
-
-.vaso-model-info-error {
-	color: var(--text-error);
-}
-
-.vaso-model-badges {
+.vaso-badges {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 4px;
-	margin-bottom: 4px;
+	gap: var(--size-4-1);
 }
 
 .vaso-model-badge {
-	font-size: 0.75em;
-	font-weight: 600;
-	padding: 1px 7px;
-	border-radius: 10px;
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-semibold);
+	padding: 0 var(--size-4-2);
+	border-radius: var(--radius-l);
 	background: var(--interactive-accent);
 	color: var(--text-on-accent);
 	white-space: nowrap;
 }
 
-.vaso-model-badge-dim {
+.vaso-model-badge.is-dim {
 	background: var(--background-modifier-border);
 	color: var(--text-muted);
 }
 
-.vaso-model-badge-cap {
-	background: var(--background-modifier-success);
+.vaso-model-badge.is-cap {
+	background: var(--background-modifier-success, var(--color-green));
 	color: var(--text-on-accent);
 }
 
-/* ── Model Default Parameters ──────────────────────────── */
-
-.vaso-model-params {
-	margin-top: 4px;
-}
-
-.vaso-model-params-title {
-	font-size: 0.78em;
+.vaso-model-defaults {
+	margin-top: var(--size-4-1);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
 	color: var(--text-muted);
-	font-weight: 600;
-	display: block;
-	margin-bottom: 3px;
 }
 
-.vaso-model-params-list {
+.vaso-suggest-meta {
+	display: block;
+	color: var(--text-muted);
+}
+
+/* ── Prompt modal ─────────────────────────────────── */
+
+.vaso-prompt-modal {
+	width: min(900px, 92vw);
+}
+
+.vaso-prompt-textarea {
+	width: 100%;
+	min-height: 40vh;
+	resize: vertical;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-small);
+	line-height: 1.5;
+}
+
+.vaso-prompt-count {
+	text-align: right;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+}
+
+.vaso-chips {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 4px;
+	gap: var(--size-4-1);
+	margin-bottom: var(--size-4-1);
 }
 
-.vaso-model-param-tag {
-	display: inline-flex;
-	align-items: center;
-	gap: 3px;
-	font-size: 0.75em;
+.vaso-chip {
 	font-family: var(--font-monospace);
-	background: var(--background-primary);
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 4px;
-	padding: 1px 6px;
+	font-size: var(--font-ui-smaller);
+	padding: var(--size-2-1) var(--size-4-2);
+	height: auto;
 }
 
-.vaso-model-param-key {
-	color: var(--text-muted);
+/* ── Phones ───────────────────────────────────────── */
+
+.is-phone .vaso-endpoint-modal .setting-item:not(.vaso-param-row):not(.vaso-modal-footer) {
+	flex-wrap: wrap;
 }
 
-.vaso-model-param-val {
-	color: var(--text-normal);
-	font-weight: 600;
+.is-phone .vaso-endpoint-modal .setting-item:not(.vaso-param-row):not(.vaso-modal-footer) .setting-item-control {
+	width: 100%;
+	justify-content: flex-start;
 }
 
-/* ── Context size slider value label ──────────────────── */
-
-.vaso-ctx-value {
-	display: inline-block;
-	min-width: 4em;
-	text-align: right;
-	font-size: 0.85em;
-	font-weight: 600;
-	font-family: var(--font-monospace);
-	color: var(--text-normal);
-	margin-left: 8px;
+.is-phone .vaso-prompt-textarea {
+	min-height: 50vh;
 }
