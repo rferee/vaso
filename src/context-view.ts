@@ -55,6 +55,7 @@ export class VasoContextView extends ItemView {
 	private busy = false;
 	/** A trigger arrived while busy: run once more afterwards. */
 	private rerun: Trigger | null = null;
+	private closed = false;
 
 	/** Raw Markdown of the answer on screen (for Copy). */
 	private answerText = "";
@@ -133,6 +134,8 @@ export class VasoContextView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.closed = true;
+		this.rerun = null;
 		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
 		if (this.streamTimer !== null) window.clearTimeout(this.streamTimer);
 		this.abortController?.abort();
@@ -147,6 +150,7 @@ export class VasoContextView extends ItemView {
 	}
 
 	private trigger(mode: Trigger): void {
+		if (this.closed) return;
 		if (this.busy) {
 			// Let the in-flight response finish (⏹ cancels it), then catch up once.
 			if (this.rerun !== "manual") this.rerun = mode;
@@ -170,7 +174,7 @@ export class VasoContextView extends ItemView {
 	// ── Refresh ──────────────────────────────────────────────
 
 	private async refresh(force: boolean): Promise<void> {
-		if (this.busy || !this.plugin.settings.contextPanelEnabled) return;
+		if (this.closed || this.busy || !this.plugin.settings.contextPanelEnabled) return;
 		const file = this.file;
 		if (!file) {
 			this.setActivity("Open a note to see its lore context.");

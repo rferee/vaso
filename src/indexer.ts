@@ -106,8 +106,36 @@ const EMBED_BATCH_SIZE = 32;
 
 interface PendingFile {
 	file: TFile;
+	/** mtime captured before reading, so a concurrent edit is re-embedded next time. */
+	mtime: number;
 	chunks: VaultChunk[];
 	vectors: (Vector | null)[];
+}
+
+interface Plan {
+	remove: Set<string>;
+	toEmbed: TFile[];
+}
+
+/** Which indexed paths to drop and which files to (re-)embed, relative to `base`. */
+function planSync(app: App, settings: VasoSettings, base: VaultIndex | null, paths?: Set<string>): Plan {
+	const remove = new Set<string>();
+	const candidates: TFile[] = [];
+
+	if (paths) {
+		for (const p of paths) {
+			const f = app.vault.getAbstractFileByPath(p);
+			if (f instanceof TFile && f.extension === "md" && isFileInScope(f.path, settings)) candidates.push(f);
+			else remove.add(p);
+		}
+	} else {
+		const inScope = app.vault.getMarkdownFiles().filter((f) => isFileInScope(f.path, settings));
+		candidates.push(...inScope);
+		const live = new Set(inScope.map((f) => f.path));
+		for (const p of Object.keys(base?.mtimes ?? {})) if (!live.has(p)) remove.add(p);
+	}
+
+	return { remove, toEmbed: candidates.filter((f) => base?.mtimes[f.path] !== f.stat.mtime) };
 }
 
 /**
@@ -116,7 +144,8 @@ interface PendingFile {
  * Unchanged files (same mtime) keep their vectors. A file is replaced only
  * when all of its chunks embedded, so a failing endpoint never drops lore that
  * was already indexed; files that failed keep their old mtime and get retried
- * on the next sync.
+ * on the next sync. Removals need no endpoint. `settings` must not change
+ * while this runs (pass a snapshot).
  */
 export async function syncIndex(
 	app: App,
@@ -125,67 +154,60 @@ export async function syncIndex(
 	opts: SyncOptions = {},
 ): Promise<SyncResult> {
 	const log = getLogger();
-	const ep = await resolveEmbeddingEndpoint(settings);
+	const mayRebuild = !opts.paths && (opts.full || opts.allowRebuild);
+	const fail = (reason: string): never => {
+		throw new IndexMismatchError(reason);
+	};
 
-	let base = existing;
-	const mismatch = base ? indexMismatch(base, settings, ep.model) : null;
-	if (base && mismatch && !opts.full && (opts.paths || !opts.allowRebuild)) {
-		throw new IndexMismatchError(mismatch);
+	const configMismatch = existing ? indexMismatch(existing, settings) : null;
+	let base = opts.full ? null : existing;
+	if (base && configMismatch) {
+		if (!mayRebuild) fail(configMismatch);
+		base = null;
 	}
+
+	let plan = planSync(app, settings, base, opts.paths);
+	let ep: EndpointConfig | null = null;
+	if (plan.toEmbed.length > 0) {
+		ep = await resolveEmbeddingEndpoint(settings);
+		if (base && base.chunks.length > 0 && base.meta.embeddingModel !== ep.model) {
+			const reason = indexMismatch(base, settings, ep.model)!;
+			if (!mayRebuild) fail(reason);
+			base = null;
+			plan = planSync(app, settings, base, opts.paths);
+		}
+	}
+
 	// A full rebuild of a still-compatible index falls back to the old vectors
 	// for files that fail to embed, so an endpoint outage loses nothing.
-	const fallback = existing && !mismatch ? existing : null;
-	if (opts.full || mismatch) base = null;
-
-	// ── Decide what to drop, keep and embed ──
-	const remove = new Set<string>();
-	const candidates: TFile[] = [];
-
-	if (opts.paths) {
-		for (const p of opts.paths) {
-			const f = app.vault.getAbstractFileByPath(p);
-			if (f instanceof TFile && f.extension === "md" && isFileInScope(f.path, settings)) {
-				candidates.push(f);
-			} else {
-				remove.add(p);
-			}
-		}
-	} else {
-		const inScope = app.vault
-			.getMarkdownFiles()
-			.filter((f) => isFileInScope(f.path, settings));
-		candidates.push(...inScope);
-		const live = new Set(inScope.map((f) => f.path));
-		for (const p of Object.keys(base?.mtimes ?? {})) {
-			if (!live.has(p)) remove.add(p);
-		}
-	}
-
-	const toEmbed = candidates.filter((f) => base?.mtimes[f.path] !== f.stat.mtime);
+	const fallback =
+		!base && existing && !configMismatch && (!ep || existing.chunks.length === 0 || existing.meta.embeddingModel === ep.model)
+			? existing
+			: null;
 
 	log.info(
 		"index",
 		`Sync (${opts.full ? "full" : opts.paths ? "incremental" : "update"}): ` +
-			`${candidates.length} candidate(s), ${toEmbed.length} to embed, ${remove.size} to drop, model=${ep.model}`,
+			`${plan.toEmbed.length} to embed, ${plan.remove.size} to drop` +
+			(ep ? `, model=${ep.model}` : ""),
 	);
 
-	// ── Chunk ──
+	// ── Chunk and embed ──
 	const pending: PendingFile[] = [];
-	for (const file of toEmbed) {
+	for (const file of plan.toEmbed) {
+		const mtime = file.stat.mtime;
 		const chunks = await chunkFile(app, file, settings);
-		pending.push({ file, chunks, vectors: chunks.map(() => null) });
+		pending.push({ file, mtime, chunks, vectors: chunks.map(() => null) });
 	}
-
-	// ── Embed ──
-	const error = await embedPending(ep, pending, opts.onProgress);
+	const error = ep ? await embedPending(ep, pending, opts.onProgress) : undefined;
 
 	// ── Assemble ──
 	const byFile = groupByFile(base?.chunks ?? []);
-	const fallbackByFile = !base && fallback ? groupByFile(fallback.chunks) : null;
+	const fallbackByFile = fallback ? groupByFile(fallback.chunks) : null;
 	const mtimes: Record<string, number> = { ...(base?.mtimes ?? {}) };
 
 	let removedFiles = 0;
-	for (const p of remove) {
+	for (const p of plan.remove) {
 		if (p in mtimes) removedFiles++;
 		byFile.delete(p);
 		delete mtimes[p];
@@ -212,25 +234,29 @@ export async function syncIndex(
 		const embedded = pf.chunks.map((c, i) => ({ ...c, vector: pf.vectors[i]! }));
 		if (embedded.length > 0) dims = embedded[0]!.vector.length;
 		byFile.set(pf.file.path, embedded);
-		mtimes[pf.file.path] = pf.file.stat.mtime;
+		mtimes[pf.file.path] = pf.mtime;
 		embeddedFiles++;
 	}
 
 	const chunks = [...byFile.values()].flat();
 	if (chunks.some((c) => c.vector.length !== dims)) {
-		throw new IndexMismatchError("The embedding endpoint returned vectors of a different size.");
+		fail("The embedding endpoint returned vectors of a different size.");
 	}
 
 	const index: VaultIndex = {
 		chunks,
 		builtAt: Date.now(),
 		mtimes,
-		meta: { embeddingModel: ep.model, dims, configKey: indexConfigKey(settings) },
+		meta: {
+			embeddingModel: ep?.model ?? base?.meta.embeddingModel ?? fallback?.meta.embeddingModel ?? "",
+			dims,
+			configKey: indexConfigKey(settings),
+		},
 	};
 
 	log.info(
 		"index",
-		`Sync done: ${chunks.length} chunks, ${embeddedFiles} file(s) embedded, ${failedFiles} failed`,
+		`Sync done: ${chunks.length} chunks, ${embeddedFiles} file(s) embedded, ${failedFiles} failed, ${removedFiles} removed`,
 	);
 	return { index, embeddedFiles, failedFiles, removedFiles, error };
 }

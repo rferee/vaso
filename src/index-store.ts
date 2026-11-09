@@ -168,7 +168,8 @@ export class IndexStore {
 	}
 
 	private async sync(label: string, opts: SyncOptions, notify: boolean): Promise<void> {
-		const settings = this.getSettings();
+		// Settings may change while a long sync runs; the vectors must match the ones it started with.
+		const settings = JSON.parse(JSON.stringify(this.getSettings())) as VasoSettings;
 		if (!hasIndexScope(settings)) {
 			this.problem = "No folders are selected for indexing yet. Choose them in Settings → Vaso → Index.";
 			this.onChange();
