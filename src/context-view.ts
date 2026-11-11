@@ -21,6 +21,7 @@ import type { ThreeLayerResult } from "./search";
 import { hasIndexScope, indexMismatch } from "./indexer";
 import { errorMessage, isAbortError } from "./errors";
 import { getLogger } from "./logger";
+import { inertMarkdown } from "./text";
 
 export const CONTEXT_VIEW_TYPE = "vaso-context";
 
@@ -514,14 +515,18 @@ export class VasoContextView extends ItemView {
 		if (answer !== undefined) this.setAnswer(answer, false);
 	}
 
-	/** Render Markdown into `el`, owning one child Component per slot so old renders unload. */
+	/**
+	 * Render model Markdown into `el`, owning one child Component per slot so
+	 * old renders unload. The text is made inert first: it may come from a
+	 * remote endpoint or carry instructions injected through an indexed note.
+	 */
 	private async renderMarkdown(slot: string, el: HTMLElement, markdown: string): Promise<void> {
 		const seq = this.renderSeq;
 		const n = (this.slotSeq.get(slot) ?? 0) + 1;
 		this.slotSeq.set(slot, n);
 		const component = this.addChild(new Component());
 		const fresh = createDiv();
-		await MarkdownRenderer.render(this.app, markdown, fresh, this.file?.path ?? "", component);
+		await MarkdownRenderer.render(this.app, inertMarkdown(markdown), fresh, this.file?.path ?? "", component);
 		if (seq !== this.renderSeq || this.slotSeq.get(slot) !== n || !el.isConnected) {
 			this.removeChild(component);
 			return;

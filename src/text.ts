@@ -124,6 +124,90 @@ export function splitParagraphs(text: string): Paragraph[] {
 	return paragraphs;
 }
 
+// ── Rendering ────────────────────────────────────────────────────
+
+const ZWSP = "\u200B";
+/** Leading container markers: indentation, quote markers and list markers. */
+const CONTAINER = /(?:[ \t]|>|[-+*][ \t]|\d{1,9}[.)][ \t])*/.source;
+/** Container markers, a fence and its info string. */
+const FENCE_LINE_RE = new RegExp(`^(${CONTAINER})(\`{3,}|~{3,})(.*)$`, "s");
+/**
+ * Container markers before `$=` or `=` (Dataview's inline query prefixes).
+ * Setext underlines of two or more `=` stay: what follows the `=` prefix then
+ * starts with `=`, which no query does.
+ */
+const QUERY_LINE_RE = new RegExp(`^(${CONTAINER})(?=\\$=|=(?!=+[ \\t]*$))`);
+
+/**
+ * Angle brackets. A URI autolink stays: as HTML its tag name would hold a `:`,
+ * so it can't become an element. An inline link or reference definition with
+ * an angle-bracket destination ([Source](<Some Note.md>)) is rewritten to the
+ * percent-encoded form, which leaves no `<` even where it isn't a link. Any
+ * other `<` before a tag name gets a zero-width space.
+ */
+const ANGLE_RE = /<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*>|(\[[^\]<`]*\]\(|^ {0,3}\[[^\]<`]+\]:[ \t]*)<([^<>`]*)>|<(?=[A-Za-z/!?])/g;
+
+const percentEncode = (c: string) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+
+/** Code spans start with a zero-width space; `<tag` and `![` are broken up rather than deleted, so none can re-form. */
+function inertInline(text: string): string {
+	return text
+		.replace(/`+/g, "$&" + ZWSP)
+		.replace(ANGLE_RE, (m, head?: string, dest?: string) =>
+			head !== undefined ? head + dest!.replace(/[ \t()]/g, percentEncode) : m === "<" ? "<" + ZWSP : m,
+		)
+		.replace(/!\[/g, "!" + ZWSP + "[");
+}
+
+/**
+ * Make model output inert before MarkdownRenderer, which runs every
+ * registered code-block and post processor and loads remote media while it
+ * renders. A zero-width space goes in front of every fence's info string, so
+ * no code-block processor (dataviewjs, …) matches the language, and at the
+ * start of code spans and code blocks, so inline query prefixes (`= …`,
+ * `$= …`) don't match. `![` and `<` before a tag name get one too, so no
+ * image, embed or HTML element is created. Which lines are fences never
+ * changes, and every line is neutralised whether or not it is inside a fence.
+ */
+export function inertMarkdown(markdown: string): string {
+	const out: string[] = [];
+	let fence: { ch: string; len: number } | null = null;
+	let codeStart = false;
+
+	// All Markdown line endings: a bare CR also ends a line.
+	for (const line of markdown.split(/\r\n?|\n/)) {
+		const m = FENCE_LINE_RE.exec(line);
+		const prefix = m?.[1] ?? "";
+		const run = m?.[2] ?? "";
+		const info = m?.[3] ?? "";
+		// A backtick in a backtick fence's info string makes it a code span instead.
+		if (m && !(run[0] === "`" && info.includes("`"))) {
+			if (fence && run[0] === fence.ch && run.length >= fence.len && !info.trim()) {
+				fence = null;
+			} else if (!fence) {
+				fence = { ch: run[0]!, len: run.length };
+				codeStart = true;
+			} else {
+				codeStart = false; // code that starts with a fence run matches no prefix
+			}
+			// The info string may also be code content or paragraph text.
+			out.push(info.trim() ? prefix + run + ZWSP + inertInline(info) : line);
+			continue;
+		}
+
+		let l = inertInline(line);
+		if (fence && codeStart && l.trim()) {
+			// First line of a code block: no prefix may match its text either.
+			codeStart = false;
+			l = l.replace(/^[ \t>]*/, "$&" + ZWSP);
+		} else {
+			l = l.replace(QUERY_LINE_RE, "$1" + ZWSP);
+		}
+		out.push(l);
+	}
+	return out.join("\n");
+}
+
 // ── Hashing ──────────────────────────────────────────────────────
 
 /** FNV-1a 32-bit hash as 8 hex chars. Fast and good enough for cache keys. */
