@@ -226,11 +226,18 @@ function nodeStream(
 		};
 
 		const req = mod.request(url, { method: "POST", headers }, (res) => {
-			if (res.statusCode && res.statusCode >= 400) {
+			const status = res.statusCode ?? 0;
+			if (status < 200 || status >= 300) {
+				// Node doesn't follow redirects (requestUrl, used for health checks and embeddings, does).
+				const location = res.headers.location;
+				const redirect =
+					status >= 300 && status < 400
+						? `Redirected to ${location ? redactUrl(location) : "another URL"}; use that URL for the endpoint`
+						: null;
 				let errBody = "";
 				res.setEncoding("utf8");
 				res.on("data", (c: string) => (errBody += c));
-				res.on("end", () => finish(new HttpError(res.statusCode ?? 0, errBody)));
+				res.on("end", () => finish(new HttpError(status, redirect ?? errBody)));
 				res.on("error", (err) => finish(err));
 				return;
 			}
