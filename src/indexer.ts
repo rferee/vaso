@@ -303,7 +303,6 @@ async function chunkFile(app: App, file: TFile, path: string, settings: VasoSett
 	const body = cleanContent(await app.vault.cachedRead(file), settings).trim();
 	if (body.length < 20) return [];
 	return chunkText(body, settings.chunkSize, settings.chunkOverlap).map((text, i) => ({
-		id: `${path}#${i}`,
 		filePath: path,
 		pageName,
 		text,

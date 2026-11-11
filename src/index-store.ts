@@ -279,7 +279,14 @@ function toStored(index: VaultIndex): StoredIndex {
 		builtAt: index.builtAt,
 		mtimes: index.mtimes,
 		meta: index.meta,
-		chunks: index.chunks.map((c) => ({ ...c, vector: encodeVector(c.vector) })),
+		// Field by field: chunks loaded from older files also carry an unused `id`.
+		chunks: index.chunks.map((c) => ({
+			filePath: c.filePath,
+			pageName: c.pageName,
+			text: c.text,
+			chunkIndex: c.chunkIndex,
+			vector: encodeVector(c.vector),
+		})),
 	};
 }
 

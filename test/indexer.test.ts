@@ -44,7 +44,7 @@ function server(up: boolean) {
 
 function chunk(filePath: string, text: string): EmbeddedChunk {
 	const pageName = filePath.slice(filePath.lastIndexOf("/") + 1, -3);
-	return { id: `${filePath}#0`, filePath, pageName, text, chunkIndex: 0, vector: new Float32Array([0, 1]) };
+	return { filePath, pageName, text, chunkIndex: 0, vector: new Float32Array([0, 1]) };
 }
 
 function oldIndex(): VaultIndex {
@@ -99,5 +99,19 @@ describe("syncIndex", () => {
 		assert.deepEqual(texts(result.index), { "Lore/Red.md": notes["Lore/Red.md"], "Lore/Blue.md": "old blue" });
 		// The failed note keeps its old mtime, so the next update retries it.
 		assert.deepEqual(result.index.mtimes, { "Lore/Red.md": 2, "Lore/Blue.md": 1 });
+	});
+
+	test("chunks carry their note, page name, text, position and vector", async () => {
+		onRequest(server(true));
+		const result = await syncIndex(fakeApp({ "Lore/Red.md": notes["Lore/Red.md"] }, 2), settings, null, { full: true });
+		assert.deepEqual(result.index.chunks, [
+			{
+				filePath: "Lore/Red.md",
+				pageName: "Red",
+				text: notes["Lore/Red.md"],
+				chunkIndex: 0,
+				vector: new Float32Array([1, 0]),
+			},
+		]);
 	});
 });

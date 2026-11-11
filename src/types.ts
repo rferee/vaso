@@ -2,8 +2,6 @@ import type { Vector } from "./vectors";
 
 /** A single chunk from a vault page, ready for embedding. */
 export interface VaultChunk {
-	/** Unique ID: filepath + chunk index */
-	id: string;
 	/** Source file path (vault-relative) */
 	filePath: string;
 	pageName: string;
