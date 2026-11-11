@@ -27,6 +27,8 @@ export class EndpointModal extends Modal {
 	private info: ModelInfo | null = null;
 	private infoFor = "";
 	private infoSeq = 0;
+	/** Origin of the server the API key was entered for; automatic lookups elsewhere go without it. */
+	private keyOrigin: string | null;
 	/** Re-rendered in place when model info arrives, so focus elsewhere isn't lost. */
 	private infoEl: HTMLElement | null = null;
 	private contextEl: HTMLElement | null = null;
@@ -39,6 +41,7 @@ export class EndpointModal extends Modal {
 	) {
 		super(app);
 		this.draft = JSON.parse(JSON.stringify(endpoint)) as EndpointConfig;
+		this.keyOrigin = urlOrigin(endpoint.url);
 	}
 
 	onOpen(): void {
@@ -72,7 +75,11 @@ export class EndpointModal extends Modal {
 				dd.setValue(d.providerType).onChange((v) => {
 					const oldDefault = defaultUrlForProvider(d.providerType);
 					d.providerType = v as ProviderType;
-					if (!d.url || d.url === oldDefault) d.url = defaultUrlForProvider(d.providerType);
+					if (!d.url || d.url === oldDefault) {
+						d.url = defaultUrlForProvider(d.providerType);
+						// The key belonged to the old provider's service, not this one.
+						d.apiKey = undefined;
+					}
 					this.info = null;
 					this.render();
 					void this.loadInfo();
@@ -110,7 +117,10 @@ export class EndpointModal extends Modal {
 			.addText((t) => {
 				t.setPlaceholder(d.providerType === "openrouter" ? "sk-or-…" : "")
 					.setValue(d.apiKey ?? "")
-					.onChange((v) => (d.apiKey = v.trim() || undefined));
+					.onChange((v) => {
+						d.apiKey = v.trim() || undefined;
+						this.keyOrigin = urlOrigin(d.url);
+					});
 				t.inputEl.type = "password";
 				plainInput(t.inputEl, "text");
 				t.inputEl.addEventListener("blur", () => void this.loadInfo());
@@ -315,17 +325,23 @@ export class EndpointModal extends Modal {
 		}
 	}
 
-	/** Fetch model details (context length, capabilities) for the current server, key and model. */
+	/**
+	 * Fetch model details (context length, capabilities) for the current server,
+	 * key and model. The key goes only to the server it was entered for; Test
+	 * and Browse are explicit and always send it.
+	 */
 	private async loadInfo(): Promise<void> {
 		const d = this.draft;
-		const key = `${d.providerType}|${d.url}|${d.model}|${d.apiKey ?? ""}`;
+		const origin = urlOrigin(d.url);
+		const apiKey = origin !== null && origin === this.keyOrigin ? d.apiKey : undefined;
+		const key = `${d.providerType}|${d.url}|${d.model}|${apiKey ?? ""}`;
 		if (!d.url || !d.model || key === this.infoFor) return;
 		this.infoFor = key;
 		const seq = ++this.infoSeq;
 
 		let info: ModelInfo | null = null;
 		try {
-			info = await showModel({ ...d }, d.model);
+			info = await showModel({ ...d, apiKey }, d.model);
 		} catch {
 			info = null;
 		}
@@ -379,6 +395,16 @@ export class EndpointModal extends Modal {
 			}
 		} catch { /* listing is optional */ }
 		return "Connected";
+	}
+}
+
+/** Origin of `url`, or null when it has none (unparseable, or no host). */
+function urlOrigin(url: string): string | null {
+	try {
+		const origin = new URL(url).origin;
+		return origin === "null" ? null : origin;
+	} catch {
+		return null;
 	}
 }
 
