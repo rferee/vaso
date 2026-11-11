@@ -121,6 +121,16 @@ export class VasoContextView extends ItemView {
 				}
 			}),
 		);
+		// Another note opened in the same tab (a link, the quick switcher) changes no leaf.
+		this.registerEvent(
+			this.app.workspace.on("file-open", (file) => {
+				if (file && file !== this.file && this.app.workspace.getActiveViewOfType(MarkdownView)?.file === file) {
+					this.file = file;
+					this.lastInputKey = "";
+					this.trigger("switch");
+				}
+			}),
+		);
 		this.registerEvent(
 			this.app.workspace.on("editor-change", (_editor, info) => {
 				if (info.file) this.file = info.file;
