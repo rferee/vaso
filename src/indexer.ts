@@ -102,6 +102,8 @@ export interface SyncResult {
 	removedFiles: number;
 	/** First embedding error, if any. */
 	error?: unknown;
+	/** The index was built without reusing the existing one (full rebuild, or an incompatible index). */
+	rebuilt: boolean;
 }
 
 const EMBED_BATCH_SIZE = 32;
@@ -279,7 +281,7 @@ export async function syncIndex(
 		"index",
 		`Sync done: ${chunks.length} chunks, ${embeddedFiles} file(s) embedded, ${failedFiles} failed, ${removedFiles} removed`,
 	);
-	return { index, embeddedFiles, failedFiles, failedPaths, removedFiles, error };
+	return { index, embeddedFiles, failedFiles, failedPaths, removedFiles, error, rebuilt: base === null };
 }
 
 function groupByFile(chunks: EmbeddedChunk[]): Map<string, EmbeddedChunk[]> {

@@ -190,6 +190,15 @@ export class IndexStore {
 					this.onChange();
 				},
 			});
+			// A rebuild where every embed failed would replace a working index with an empty one.
+			if (result.rebuilt && result.index.chunks.length === 0 && result.failedFiles > 0 && this.chunkCount > 0) {
+				this.problem =
+					"Nothing could be embedded" +
+					(result.error ? ` (${errorMessage(result.error)})` : "") +
+					"; the previous index was kept.";
+				notice?.setMessage(`Vaso: ${this.problem}`);
+				return;
+			}
 			this.index = result.index;
 			// An incremental update only looks at its own paths: retry the failed ones with the next change.
 			if (opts.paths) for (const p of result.failedPaths) this.pendingPaths.add(p);
