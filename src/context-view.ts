@@ -58,6 +58,8 @@ export class VasoContextView extends ItemView {
 	private rerun: Trigger | null = null;
 	private closed = false;
 
+	/** The note whose answer and sources the body shows; null for a placeholder. */
+	private shownFile: TFile | null = null;
 	/** Raw Markdown of the answer on screen (for Copy). */
 	private answerText = "";
 	private tokensText = "—";
@@ -106,7 +108,7 @@ export class VasoContextView extends ItemView {
 		this.bodyEl.on("click", "a.internal-link", (evt, a) => {
 			evt.preventDefault();
 			const target = a.getAttr("data-href") ?? a.getText();
-			void this.app.workspace.openLinkText(target, this.file?.path ?? "", evt.ctrlKey || evt.metaKey);
+			void this.app.workspace.openLinkText(target, (this.shownFile ?? this.file)?.path ?? "", evt.ctrlKey || evt.metaKey);
 		});
 
 		await this.llmCache.load();
@@ -232,6 +234,7 @@ export class VasoContextView extends ItemView {
 				// Allow a retry on the next edit even if the text didn't change.
 				this.lastInputKey = "";
 			}
+			this.clearOtherNote(file);
 		} finally {
 			this.busy = false;
 			this.abortController = null;
@@ -248,13 +251,16 @@ export class VasoContextView extends ItemView {
 				return;
 			case "tooShort":
 				this.setActivity("Write a bit more to get context.");
+				this.clearOtherNote(file);
 				return;
 			case "noIndex":
 				this.setActivity("The index is empty.");
+				this.clearOtherNote(file);
 				this.renderStatus();
 				return;
 			case "indexProblem":
 				this.setActivity("The index needs a rebuild.");
+				this.clearOtherNote(file);
 				this.plugin.store.reportMismatch(run.message);
 				return;
 			case "noMatches":
@@ -264,7 +270,7 @@ export class VasoContextView extends ItemView {
 			case "cached":
 				this.setActivity("Cached answer (sources unchanged)");
 				this.setTokens("—");
-				this.renderSynthesis(run.sources);
+				this.renderSynthesis(file, run.sources);
 				this.setAnswer(run.response, true);
 				return;
 			case "ready":
@@ -298,7 +304,7 @@ export class VasoContextView extends ItemView {
 			done: "Done",
 		};
 
-		this.renderSynthesis(run.sources);
+		this.renderSynthesis(file, run.sources);
 		this.setAnswer("", false);
 		this.setActivity("Connecting…");
 		this.setTokens(`~${promptTokens} in · waiting…`);
@@ -440,14 +446,21 @@ export class VasoContextView extends ItemView {
 
 	private renderPlaceholder(text: string): void {
 		this.clearMarkdown();
+		this.shownFile = null;
 		this.bodyEl.empty();
 		this.bodyEl.createDiv({ cls: "vaso-placeholder", text });
 	}
 
-	/** Lay out the answer area and the source list. */
-	private renderSynthesis(sources: ThreeLayerResult): void {
+	/** Replace another note's answer and sources with the current activity text. */
+	private clearOtherNote(file: TFile): void {
+		if (this.shownFile !== file) this.renderPlaceholder(this.activityText);
+	}
+
+	/** Lay out the answer area and the source list for `file`. */
+	private renderSynthesis(file: TFile, sources: ThreeLayerResult): void {
 		this.clearMarkdown();
 		this.renderSeq++;
+		this.shownFile = file;
 		this.bodyEl.empty();
 
 		const synth = this.bodyEl.createDiv("vaso-synthesis");
@@ -536,7 +549,7 @@ export class VasoContextView extends ItemView {
 		this.slotSeq.set(slot, n);
 		const component = this.addChild(new Component());
 		const fresh = createDiv();
-		await MarkdownRenderer.render(this.app, inertMarkdown(markdown), fresh, this.file?.path ?? "", component);
+		await MarkdownRenderer.render(this.app, inertMarkdown(markdown), fresh, (this.shownFile ?? this.file)?.path ?? "", component);
 		if (seq !== this.renderSeq || this.slotSeq.get(slot) !== n || !el.isConnected) {
 			this.removeChild(component);
 			return;
