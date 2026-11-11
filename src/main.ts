@@ -89,9 +89,10 @@ export default class VasoPlugin extends Plugin {
 
 	private registerVaultEvents(): void {
 		const changed = (file: TAbstractFile, oldPath?: string) => {
+			// Renaming a note to another extension still has to drop the old path.
+			if (oldPath?.endsWith(".md")) this.store.noteChanged(oldPath);
 			if (!(file instanceof TFile) || file.extension !== "md") return;
 			this.store.noteChanged(file.path);
-			if (oldPath) this.store.noteChanged(oldPath);
 		};
 		this.registerEvent(this.app.vault.on("create", (f) => changed(f)));
 		this.registerEvent(this.app.vault.on("modify", (f) => changed(f)));
