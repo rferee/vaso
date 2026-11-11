@@ -32,6 +32,15 @@ export class Notice {
 	hide(): void {}
 }
 
+// Base classes the settings UI extends; loading those modules needs them, the tests don't use them.
+export class Modal {}
+export class SuggestModal {}
+export class FuzzySuggestModal {}
+export class Setting {}
+export function prepareFuzzySearch(): () => null {
+	return () => null;
+}
+
 // ── requestUrl ──────────────────────────────────────────────────
 
 export interface StubRequest {

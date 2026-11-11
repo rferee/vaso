@@ -14,6 +14,16 @@ const USES_CONTEXT: ProviderType[] = ["ollama", "lmstudio"];
 /** Providers with a thinking/reasoning control. */
 const USES_THINKING: ProviderType[] = ["ollama", "openrouter", "lmstudio"];
 
+/**
+ * Whether the context-window setting reaches the server for this endpoint.
+ * LM Studio applies it only when loading a model for chat; its embedding
+ * requests don't carry it.
+ */
+export function usesContextSize(ep: Pick<EndpointConfig, "type" | "providerType">): boolean {
+	if (ep.type === "embedding" && ep.providerType === "lmstudio") return false;
+	return USES_CONTEXT.includes(ep.providerType);
+}
+
 export function fmtTokens(n: number): string {
 	return n >= 1024 && n % 1024 === 0 ? `${n / 1024}k` : n.toLocaleString();
 }
@@ -243,7 +253,7 @@ export class EndpointModal extends Modal {
 	private renderContextSize(parent: HTMLElement): void {
 		const d = this.draft;
 		parent.empty();
-		if (!USES_CONTEXT.includes(d.providerType)) return;
+		if (!usesContextSize(d)) return;
 		const known = this.info?.contextLength;
 		// The options double up to `max`: it must be a sane positive integer.
 		const max = known !== undefined && Number.isSafeInteger(known) && known > 0 ? known : CONTEXT_FALLBACK_MAX;
