@@ -191,6 +191,8 @@ export class IndexStore {
 				},
 			});
 			this.index = result.index;
+			// An incremental update only looks at its own paths: retry the failed ones with the next change.
+			if (opts.paths) for (const p of result.failedPaths) this.pendingPaths.add(p);
 			if (result.embeddedFiles > 0 || result.removedFiles > 0 || opts.full) {
 				this.scheduleSave();
 				if (notify) await this.save();
@@ -210,6 +212,7 @@ export class IndexStore {
 					: `Vaso: index ready — ${this.chunkCount} chunks from ${this.pageCount} pages`,
 			);
 		} catch (err) {
+			if (opts.paths) for (const p of opts.paths) this.pendingPaths.add(p);
 			this.needsRebuild = err instanceof IndexMismatchError;
 			this.problem = this.needsRebuild
 				? `${errorMessage(err)} Rebuild the index to use it again.`

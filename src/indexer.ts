@@ -96,6 +96,8 @@ export interface SyncResult {
 	embeddedFiles: number;
 	/** Files that needed embedding but kept their old chunks (or none) because embedding failed. */
 	failedFiles: number;
+	/** Paths of those files. */
+	failedPaths: string[];
 	/** Previously indexed files that were dropped (deleted, renamed or out of scope). */
 	removedFiles: number;
 	/** First embedding error, if any. */
@@ -148,8 +150,9 @@ function planSync(app: App, settings: VasoSettings, base: VaultIndex | null, pat
  * Unchanged files (same mtime) keep their vectors. A file is replaced only
  * when all of its chunks embedded, so a failing endpoint never drops lore that
  * was already indexed; files that failed keep their old mtime and get retried
- * on the next sync. Removals need no endpoint. `settings` must not change
- * while this runs (pass a snapshot).
+ * on the next sync. Removals need no endpoint: when an incremental update
+ * finds none, it still applies them and reports the files to embed as
+ * failed. `settings` must not change while this runs (pass a snapshot).
  */
 export async function syncIndex(
 	app: App,
@@ -172,9 +175,16 @@ export async function syncIndex(
 
 	let plan = planSync(app, settings, base, opts.paths);
 	let ep: EndpointConfig | null = null;
+	let error: unknown;
 	if (plan.toEmbed.length > 0) {
-		ep = await resolveEmbeddingEndpoint(settings);
-		if (base && base.chunks.length > 0 && base.meta.embeddingModel !== ep.model) {
+		try {
+			ep = await resolveEmbeddingEndpoint(settings);
+		} catch (err) {
+			// Full and update runs fail as a whole; the next mtime scan covers them.
+			if (!opts.paths) throw err;
+			error = err;
+		}
+		if (ep && base && base.chunks.length > 0 && base.meta.embeddingModel !== ep.model) {
 			const reason = indexMismatch(base, settings, ep.model)!;
 			if (!mayRebuild) fail(reason);
 			base = null;
@@ -198,13 +208,19 @@ export async function syncIndex(
 
 	// ── Chunk and embed ──
 	const pending: PendingFile[] = [];
-	for (const file of plan.toEmbed) {
-		const path = file.path;
-		const mtime = file.stat.mtime;
-		const chunks = await chunkFile(app, file, path, settings);
-		pending.push({ path, mtime, chunks, vectors: chunks.map(() => null) });
+	const failedPaths: string[] = [];
+	if (ep) {
+		for (const file of plan.toEmbed) {
+			const path = file.path;
+			const mtime = file.stat.mtime;
+			const chunks = await chunkFile(app, file, path, settings);
+			pending.push({ path, mtime, chunks, vectors: chunks.map(() => null) });
+		}
+		error = await embedPending(ep, pending, opts.onProgress);
+	} else {
+		// No endpoint: these files keep whatever `base` holds for them.
+		failedPaths.push(...plan.toEmbed.map((f) => f.path));
 	}
-	const error = ep ? await embedPending(ep, pending, opts.onProgress) : undefined;
 
 	// ── Assemble ──
 	const byFile = groupByFile(base?.chunks ?? []);
@@ -219,12 +235,11 @@ export async function syncIndex(
 	}
 
 	let embeddedFiles = 0;
-	let failedFiles = 0;
 	let dims = base?.meta.dims ?? 0;
 
 	for (const pf of pending) {
 		if (!pf.vectors.every((v) => v !== null)) {
-			failedFiles++;
+			failedPaths.push(pf.path);
 			const oldMtime = fallback?.mtimes[pf.path];
 			if (fallbackByFile && oldMtime !== undefined) {
 				const old = fallbackByFile.get(pf.path) ?? [];
@@ -259,11 +274,12 @@ export async function syncIndex(
 		},
 	};
 
+	const failedFiles = failedPaths.length;
 	log.info(
 		"index",
 		`Sync done: ${chunks.length} chunks, ${embeddedFiles} file(s) embedded, ${failedFiles} failed, ${removedFiles} removed`,
 	);
-	return { index, embeddedFiles, failedFiles, removedFiles, error };
+	return { index, embeddedFiles, failedFiles, failedPaths, removedFiles, error };
 }
 
 function groupByFile(chunks: EmbeddedChunk[]): Map<string, EmbeddedChunk[]> {
