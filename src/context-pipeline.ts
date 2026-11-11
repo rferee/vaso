@@ -3,7 +3,7 @@ import type { EndpointConfig, VasoSettings } from "./types";
 import type { ChatMessage } from "./llm";
 import { embedQuery, embedTexts, resolveEmbeddingEndpoint } from "./llm";
 import type { VaultIndex } from "./indexer";
-import { indexMismatch } from "./indexer";
+import { indexMismatch, isFileInScope } from "./indexer";
 import { threeLayerSearch } from "./search";
 import type { ThreeLayerResult } from "./search";
 import {
@@ -103,6 +103,10 @@ export class ContextPipeline {
 		}
 
 		if (!index || index.chunks.length === 0) return { run: { kind: "noIndex" }, inputKey };
+		// Notes taken out of the index scope keep their chunks until the next
+		// update; they must not be retrieved and sent to the LLM in the meantime.
+		const chunks = index.chunks.filter((c) => isFileInScope(c.filePath, settings));
+		if (chunks.length === 0) return { run: { kind: "noMatches" }, inputKey };
 		const ep = await resolveEmbeddingEndpoint(settings);
 		const mismatch = indexMismatch(index, settings, ep.model);
 		if (mismatch) {
@@ -126,7 +130,7 @@ export class ContextPipeline {
 		const sources = threeLayerSearch(
 			l0Vec,
 			noteVecs,
-			index.chunks,
+			chunks,
 			{ l0: settings.l0Chunks, l1: settings.l1Chunks, l2: settings.l2Chunks },
 			file.path,
 		);
@@ -140,7 +144,7 @@ export class ContextPipeline {
 			title: file.basename,
 			paragraph: cursor?.paragraph ?? "",
 			writing: lastWords(fullText, settings.contextWords),
-			l0: await buildL0Context(sources.l0, this.app, settings, index.chunks),
+			l0: await buildL0Context(sources.l0, this.app, settings, chunks),
 			l1: await buildFullPageContext(sources.l1, this.app, settings),
 			l2: buildChunkContext(sources.l2),
 		};
