@@ -83,7 +83,15 @@ async function ensureModelLoaded(ep: EndpointConfig): Promise<void> {
 	}
 }
 
-/** Native /api/v1/chat event stream. Throws when the stream reports an error and produced no text. */
+/** A native stream that reported an error after text arrived: a fallback request would start the answer over. */
+class LMStudioStreamError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "LMStudioStreamError";
+	}
+}
+
+/** Native /api/v1/chat event stream. Throws when the stream reports an error. */
 async function consumeNativeStream(
 	reader: ReadableStreamDefaultReader<Uint8Array>,
 	cb: StreamCallback,
@@ -175,7 +183,10 @@ async function consumeNativeStream(
 	});
 	for (const ev of parseSSE(buffer + "\n\n").events) handle(ev.event, ev.data);
 
-	if (failure.message && !text) throw new Error(`LM Studio: ${failure.message}`);
+	if (failure.message) {
+		const message = `LM Studio: ${failure.message}`;
+		throw text ? new LMStudioStreamError(message) : new Error(message);
+	}
 	cb.onStatus("done");
 	return { text, stats };
 }
@@ -254,7 +265,7 @@ export const lmstudioProvider: LLMProvider = {
 			const reader = await fetchStream(joinUrl(ep.url, "/api/v1/chat"), nativeChatBody(ep, messages), buildHeaders(ep), signal);
 			return await consumeNativeStream(reader, cb);
 		} catch (err) {
-			if (signal?.aborted) throw err;
+			if (signal?.aborted || err instanceof LMStudioStreamError) throw err;
 			log.warn("infer", "LM Studio native chat failed, falling back to /v1/chat/completions", err);
 		}
 
