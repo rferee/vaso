@@ -62,6 +62,20 @@ export function joinUrl(base: string, path: string): string {
 	return base.replace(/\/+$/, "") + path;
 }
 
+/** The URL without the user name and password it may carry, for logs and the UI. */
+export function redactUrl(url: string): string {
+	try {
+		const u = new URL(url);
+		if (u.host) {
+			if (!u.username && !u.password) return url;
+			u.username = "";
+			u.password = "";
+			return u.toString();
+		}
+	} catch { /* not a URL: strip by hand */ }
+	return url.replace(/^([^/?#@]*\/\/)?[^/?#]*@/, "$1");
+}
+
 /** An HTTP error status, with the start of the response body for context. */
 export class HttpError extends Error {
 	constructor(

@@ -5,6 +5,7 @@ import { openaiCompatProvider } from "./openai-compat";
 import { openrouterProvider } from "./openrouter";
 import { lmstudioProvider } from "./lmstudio";
 import { errorMessage, withTimeout } from "../errors";
+import { redactUrl } from "./http";
 import { getLogger } from "../logger";
 import type { LogCategory } from "../logger";
 
@@ -58,12 +59,12 @@ export async function resolveEndpoint(
 	for (const ep of endpoints) {
 		try {
 			await checkEndpoint(ep);
-			log.debug(category, `Using ${ep.name} (${ep.url}, ${ep.model})`);
+			log.debug(category, `Using ${ep.name} (${redactUrl(ep.url)}, ${ep.model})`);
 			resolveCache.set(key, { ep, expiresAt: Date.now() + RESOLVE_TTL_MS });
 			return ep;
 		} catch (err) {
-			failures.push(`${ep.name || ep.url}: ${errorMessage(err)}`);
-			log.warn(category, `${ep.name} (${ep.url}) unreachable`, err);
+			failures.push(`${ep.name || redactUrl(ep.url)}: ${errorMessage(err)}`);
+			log.warn(category, `${ep.name} (${redactUrl(ep.url)}) unreachable`, err);
 		}
 	}
 

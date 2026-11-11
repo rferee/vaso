@@ -12,6 +12,7 @@ import { checkEndpoint } from "../llm";
 import { hasIndexScope, indexMismatch } from "../indexer";
 import { TEMPLATE_VARIABLES } from "../prompt-builder";
 import { errorMessage } from "../errors";
+import { redactUrl } from "../providers/http";
 import { EndpointModal } from "./endpoint-modal";
 import { PromptModal } from "./prompt-modal";
 import { ConfirmModal, FolderSuggestModal } from "./suggest";
@@ -136,7 +137,7 @@ export class VasoSettingTab extends PluginSettingTab {
 		list: EndpointConfig[],
 		type: EndpointKind,
 	): void {
-		const host = ep.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+		const host = redactUrl(ep.url).replace(/^https?:\/\//, "").replace(/\/.*$/, "");
 		row.setName(`${i + 1}. ${ep.name || PROVIDER_LABELS[ep.providerType]}`);
 		row.setDesc(
 			createFragment((f) => {
@@ -206,7 +207,7 @@ export class VasoSettingTab extends PluginSettingTab {
 					new ConfirmModal(
 						this.app,
 						"Remove endpoint?",
-						`"${ep.name || ep.url}" will be removed from the ${type} endpoints.`,
+						`"${ep.name || redactUrl(ep.url)}" will be removed from the ${type} endpoints.`,
 						"Remove",
 						() => {
 							list.splice(i, 1);
