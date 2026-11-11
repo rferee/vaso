@@ -88,6 +88,8 @@ export interface SyncOptions {
 	/** Only look at these paths (incremental update). Default: the whole vault. */
 	paths?: Set<string>;
 	onProgress?: (done: number, total: number) => void;
+	/** Stops the sync: it throws the abort reason and embeds nothing more. */
+	signal?: AbortSignal;
 }
 
 export interface SyncResult {
@@ -213,12 +215,13 @@ export async function syncIndex(
 	const failedPaths: string[] = [];
 	if (ep) {
 		for (const file of plan.toEmbed) {
+			opts.signal?.throwIfAborted();
 			const path = file.path;
 			const mtime = file.stat.mtime;
 			const chunks = await chunkFile(app, file, path, settings);
 			pending.push({ path, mtime, chunks, vectors: chunks.map(() => null) });
 		}
-		error = await embedPending(ep, pending, opts.onProgress);
+		error = await embedPending(ep, pending, opts.onProgress, opts.signal);
 	} else {
 		// No endpoint: these files keep whatever `base` holds for them.
 		failedPaths.push(...plan.toEmbed.map((f) => f.path));
@@ -308,21 +311,27 @@ async function chunkFile(app: App, file: TFile, path: string, settings: VasoSett
 	}));
 }
 
-/** Embed all pending chunks in batches with one endpoint. Stops at the first failed batch. */
+/**
+ * Embed all pending chunks in batches with one endpoint. Stops at the first
+ * failed batch; throws on abort.
+ */
 async function embedPending(
 	ep: EndpointConfig,
 	pending: PendingFile[],
 	onProgress?: (done: number, total: number) => void,
+	signal?: AbortSignal,
 ): Promise<unknown> {
 	const slots: { pf: PendingFile; i: number }[] = [];
 	for (const pf of pending) pf.chunks.forEach((_, i) => slots.push({ pf, i }));
 
 	for (let start = 0; start < slots.length; start += EMBED_BATCH_SIZE) {
+		signal?.throwIfAborted();
 		const batch = slots.slice(start, start + EMBED_BATCH_SIZE);
 		try {
-			const vecs = await embedTexts(ep, batch.map((s) => s.pf.chunks[s.i]!.text));
+			const vecs = await embedTexts(ep, batch.map((s) => s.pf.chunks[s.i]!.text), signal);
 			batch.forEach((s, j) => (s.pf.vectors[s.i] = vecs[j] ?? null));
 		} catch (err) {
+			if (signal?.aborted) throw err;
 			getLogger().error("index", "Embedding batch failed", err);
 			return err;
 		}

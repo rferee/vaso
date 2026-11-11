@@ -56,6 +56,10 @@ export class IndexStore {
 	private changes = 0;
 	/** Writes run one at a time. */
 	private saving: Promise<void> = Promise.resolve();
+	/** Set by shutdown(): nothing embeds, schedules a save or reports a change anymore. */
+	private closed = false;
+	/** Stops a running sync on shutdown. */
+	private abort = new AbortController();
 
 	constructor(
 		private app: App,
@@ -97,6 +101,7 @@ export class IndexStore {
 	}
 
 	private scheduleSave(): void {
+		if (this.closed) return;
 		this.dirty = true;
 		this.changes++;
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
@@ -127,6 +132,9 @@ export class IndexStore {
 	}
 
 	async shutdown(): Promise<void> {
+		this.closed = true;
+		// A running sync stops embedding and drops its result.
+		this.abort.abort();
 		if (this.updateTimer !== null) window.clearTimeout(this.updateTimer);
 		this.updateTimer = null;
 		// Pending paths are picked up by the mtime check on the next start.
@@ -172,6 +180,7 @@ export class IndexStore {
 	}
 
 	private run(label: string, opts: SyncOptions, notify: boolean): Promise<void> {
+		if (this.closed) return Promise.resolve();
 		const task = () => this.sync(label, opts, notify);
 		const next = this.queue.then(task, task);
 		this.queue = next.catch(() => undefined);
@@ -179,6 +188,8 @@ export class IndexStore {
 	}
 
 	private async sync(label: string, opts: SyncOptions, notify: boolean): Promise<void> {
+		// Queued before shutdown.
+		if (this.closed) return;
 		// Settings may change while a long sync runs; the vectors must match the ones it started with.
 		const settings = JSON.parse(JSON.stringify(this.getSettings())) as VasoSettings;
 		if (!hasIndexScope(settings)) {
@@ -195,12 +206,14 @@ export class IndexStore {
 		try {
 			const result = await syncIndex(this.app, settings, this.index, {
 				...opts,
+				signal: this.abort.signal,
 				onProgress: (done, total) => {
 					this.progress = { label, done, total };
 					notice?.setMessage(`Vaso: ${label} — ${done}/${total} chunks`);
 					this.onChange();
 				},
 			});
+			if (this.closed) return;
 			// A rebuild where every embed failed would replace a working index with an empty one.
 			if (result.rebuilt && result.index.chunks.length === 0 && result.failedFiles > 0 && this.chunkCount > 0) {
 				this.problem =
@@ -235,6 +248,7 @@ export class IndexStore {
 					: `Vaso: index ready — ${this.chunkCount} chunks from ${this.pageCount} pages`,
 			);
 		} catch (err) {
+			if (this.closed) return;
 			if (opts.paths) for (const p of opts.paths) this.pendingPaths.add(p);
 			this.needsRebuild = err instanceof IndexMismatchError;
 			this.problem = this.needsRebuild
@@ -244,8 +258,12 @@ export class IndexStore {
 			notice?.setMessage(`Vaso: ${this.problem}`);
 		} finally {
 			this.progress = null;
-			this.onChange();
-			if (notice) window.setTimeout(() => notice.hide(), 5000);
+			if (this.closed) {
+				notice?.hide();
+			} else {
+				this.onChange();
+				if (notice) window.setTimeout(() => notice.hide(), 5000);
+			}
 		}
 	}
 }
