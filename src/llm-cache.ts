@@ -17,6 +17,10 @@ const MAX_CACHE_ENTRIES = 200;
 export class LLMCache {
 	private entries = new Map<string, CacheEntry>();
 	private dirty = false;
+	/** Bumped on every change: a write clears `dirty` only if nothing changed while it ran. */
+	private changes = 0;
+	/** Writes run one at a time. */
+	private saving: Promise<void> = Promise.resolve();
 	private pluginDir: string;
 	private adapter: DataAdapter;
 
@@ -51,6 +55,7 @@ export class LLMCache {
 		this.entries.delete(filePath);
 		this.entries.set(filePath, { cacheKey, response });
 		this.dirty = true;
+		this.changes++;
 
 		// Evict oldest entries if over the limit
 		while (this.entries.size > MAX_CACHE_ENTRIES) {
@@ -78,13 +83,19 @@ export class LLMCache {
 		}
 	}
 
-	async save(): Promise<void> {
+	save(): Promise<void> {
+		this.saving = this.saving.then(() => this.write());
+		return this.saving;
+	}
+
+	private async write(): Promise<void> {
 		if (!this.dirty) return;
+		const changes = this.changes;
 		try {
 			const obj: Record<string, CacheEntry> = {};
 			for (const [k, v] of this.entries) obj[k] = v;
 			await this.adapter.write(this.getPath(), JSON.stringify(obj));
-			this.dirty = false;
+			if (this.changes === changes) this.dirty = false;
 		} catch (err) {
 			getLogger().warn("cache", "Could not save LLM cache", err);
 		}

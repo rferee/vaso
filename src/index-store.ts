@@ -52,6 +52,10 @@ export class IndexStore {
 	private updateTimer: number | null = null;
 	private saveTimer: number | null = null;
 	private dirty = false;
+	/** Bumped on every change: a write clears `dirty` only if nothing changed while it ran. */
+	private changes = 0;
+	/** Writes run one at a time. */
+	private saving: Promise<void> = Promise.resolve();
 
 	constructor(
 		private app: App,
@@ -94,6 +98,7 @@ export class IndexStore {
 
 	private scheduleSave(): void {
 		this.dirty = true;
+		this.changes++;
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.saveTimer = window.setTimeout(() => {
 			this.saveTimer = null;
@@ -101,15 +106,21 @@ export class IndexStore {
 		}, SAVE_DEBOUNCE_MS);
 	}
 
-	async save(): Promise<void> {
+	save(): Promise<void> {
 		if (this.saveTimer !== null) {
 			window.clearTimeout(this.saveTimer);
 			this.saveTimer = null;
 		}
+		this.saving = this.saving.then(() => this.write());
+		return this.saving;
+	}
+
+	private async write(): Promise<void> {
 		if (!this.dirty || !this.index) return;
+		const changes = this.changes;
 		try {
 			await this.app.vault.adapter.write(this.filePath, JSON.stringify(toStored(this.index)));
-			this.dirty = false;
+			if (this.changes === changes) this.dirty = false;
 		} catch (err) {
 			getLogger().warn("main", "Could not save the index", err);
 		}
