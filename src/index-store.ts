@@ -199,15 +199,18 @@ export class IndexStore {
 			}
 
 			this.needsRebuild = false;
-			if (result.error) {
+			// A note the server rejects on its own fails without an error for the whole run.
+			const failed = !!result.error || result.failedFiles > 0;
+			if (failed) {
 				this.problem =
-					`${result.failedFiles} file(s) could not be embedded (${errorMessage(result.error)}). ` +
-					"They keep their previous version and are retried on the next update.";
+					`${result.failedFiles} file(s) could not be embedded` +
+					(result.error ? ` (${errorMessage(result.error)})` : "") +
+					". They keep their previous version, if any, and are retried on the next update.";
 			} else {
 				this.problem = null;
 			}
 			notice?.setMessage(
-				result.error
+				failed
 					? `Vaso: ${this.problem}`
 					: `Vaso: index ready — ${this.chunkCount} chunks from ${this.pageCount} pages`,
 			);
