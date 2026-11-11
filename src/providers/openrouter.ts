@@ -1,15 +1,13 @@
 import type { EndpointConfig } from "../types";
-import { getLogger } from "../logger";
 import {
 	buildHeaders,
 	consumeOpenAIStream,
-	customParamsFlat,
 	fetchStream,
 	HttpError,
 	joinUrl,
 	requestJson,
 } from "./http";
-import { openAIChatBody, parseOpenAIEmbeddings } from "./openai-compat";
+import { openAIChatBody, openAIEmbed } from "./openai-compat";
 import type { ChatMessage, LLMProvider, ModelEntry } from "./types";
 
 /** App attribution (https://openrouter.ai/docs/app-attribution). */
@@ -52,15 +50,8 @@ export const openrouterProvider: LLMProvider = {
 		return null;
 	},
 
-	async embedBatch(ep, texts) {
-		if (texts.length === 0) return [];
-		getLogger().debug("embed", `OpenRouter embed: ${texts.length} text(s), model=${ep.model}`);
-		const data = await requestJson(joinUrl(ep.url, "/embeddings"), {
-			method: "POST",
-			body: { ...customParamsFlat(ep.customParams), model: ep.model, input: texts },
-			headers: headers(ep),
-		});
-		return parseOpenAIEmbeddings(data, texts.length, "OpenRouter");
+	embedBatch(ep, texts) {
+		return openAIEmbed(joinUrl(ep.url, "/embeddings"), ep, texts, headers(ep), "OpenRouter");
 	},
 
 	async chatStream(ep, messages, cb, signal) {

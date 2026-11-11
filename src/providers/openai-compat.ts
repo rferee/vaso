@@ -35,12 +35,30 @@ export function openAIChatBody(ep: EndpointConfig, messages: ChatMessage[]): Rec
 }
 
 /** Parse an OpenAI-style embeddings response into vectors in input order. */
-export function parseOpenAIEmbeddings(data: unknown, expected: number, provider: string): number[][] {
+function parseOpenAIEmbeddings(data: unknown, expected: number, provider: string): number[][] {
 	const entries = (data as { data?: Array<{ embedding: number[]; index: number }> } | null)?.data;
 	if (!Array.isArray(entries) || entries.length !== expected) {
 		throw new Error(`Invalid embedding response from ${provider}`);
 	}
 	return [...entries].sort((a, b) => a.index - b.index).map((e) => e.embedding);
+}
+
+/** OpenAI-style embeddings request (OpenAI-compatible servers, OpenRouter, LM Studio). */
+export async function openAIEmbed(
+	url: string,
+	ep: EndpointConfig,
+	texts: string[],
+	headers: Record<string, string>,
+	label: string,
+): Promise<number[][]> {
+	if (texts.length === 0) return [];
+	getLogger().debug("embed", `Embedding ${texts.length} text(s) with ${label}, model=${ep.model}`);
+	const data = await requestJson(url, {
+		method: "POST",
+		body: { ...customParamsFlat(ep.customParams), model: ep.model, input: texts },
+		headers,
+	});
+	return parseOpenAIEmbeddings(data, texts.length, label);
 }
 
 export async function listOpenAIModels(url: string, ep: EndpointConfig): Promise<ModelEntry[]> {
@@ -65,15 +83,8 @@ export const openaiCompatProvider: LLMProvider = {
 		return null;
 	},
 
-	async embedBatch(ep, texts) {
-		if (texts.length === 0) return [];
-		getLogger().debug("embed", `OpenAI-compat embed: ${texts.length} text(s), model=${ep.model}`);
-		const data = await requestJson(v1(ep, "/embeddings"), {
-			method: "POST",
-			body: { ...customParamsFlat(ep.customParams), model: ep.model, input: texts },
-			headers: buildHeaders(ep),
-		});
-		return parseOpenAIEmbeddings(data, texts.length, "the OpenAI-compatible endpoint");
+	embedBatch(ep, texts) {
+		return openAIEmbed(v1(ep, "/embeddings"), ep, texts, buildHeaders(ep), "the OpenAI-compatible endpoint");
 	},
 
 	async chatStream(ep, messages, cb, signal) {

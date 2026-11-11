@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { TestContext } from "node:test";
-import { onRequest } from "./obsidian-stub";
+import { onRequest, requests } from "./obsidian-stub";
 import { lmstudioProvider } from "../src/providers/lmstudio";
 import { ollamaProvider } from "../src/providers/ollama";
 import { openaiCompatProvider } from "../src/providers/openai-compat";
 import { openrouterProvider } from "../src/providers/openrouter";
-import type { StreamCallback } from "../src/providers/types";
+import type { LLMProvider, StreamCallback } from "../src/providers/types";
 import { createDefaultEndpoint } from "../src/types";
 import type { ProviderType } from "../src/types";
 
@@ -102,4 +102,59 @@ describe("chat token counts", () => {
 		const result = await lmstudioProvider.chatStream(endpoint("lmstudio", "http://lms.test"), messages, quiet);
 		assert.deepEqual(result, { text: "The Tide Queen.", stats: { promptTokens: 120, responseTokens: 4 } });
 	});
+});
+
+describe("OpenAI-style embeddings", () => {
+	const cases: [string, LLMProvider, ProviderType, string, string, Record<string, string>][] = [
+		["OpenAI-compatible", openaiCompatProvider, "openai-compat", "http://vllm.test", "http://vllm.test/v1/embeddings", {}],
+		["OpenAI-compatible at /v1", openaiCompatProvider, "openai-compat", "http://vllm.test/v1/", "http://vllm.test/v1/embeddings", {}],
+		[
+			"OpenRouter",
+			openrouterProvider,
+			"openrouter",
+			"https://openrouter.test/api/v1",
+			"https://openrouter.test/api/v1/embeddings",
+			{ "X-OpenRouter-Title": "Vaso" },
+		],
+		["LM Studio", lmstudioProvider, "lmstudio", "http://lms.test/", "http://lms.test/v1/embeddings", {}],
+	];
+
+	for (const [name, provider, providerType, url, embedUrl, extraHeaders] of cases) {
+		test(name, async () => {
+			const ep = {
+				...endpoint(providerType, url, "embedding"),
+				customParams: [
+					{ key: "dimensions", value: "2" },
+					{ key: "model", value: "overridden" },
+				],
+			};
+			onRequest(() => ({
+				json: {
+					data: [
+						{ index: 1, embedding: [0, 1] },
+						{ index: 0, embedding: [1, 0] },
+					],
+				},
+			}));
+			assert.deepEqual(await provider.embedBatch(ep, ["red", "blue"]), [
+				[1, 0],
+				[0, 1],
+			]);
+			assert.deepEqual(requests, [
+				{
+					url: embedUrl,
+					method: "POST",
+					headers: { "Content-Type": "application/json", ...extraHeaders, Authorization: "Bearer test-key" },
+					body: { dimensions: 2, model: "m", input: ["red", "blue"] },
+				},
+			]);
+
+			onRequest(() => ({ json: { data: [{ index: 0, embedding: [1, 0] }] } }));
+			await assert.rejects(provider.embedBatch(ep, ["red", "blue"]), /Invalid embedding response/);
+
+			onRequest(() => ({ json: {} }));
+			assert.deepEqual(await provider.embedBatch(ep, []), []);
+			assert.equal(requests.length, 0);
+		});
+	}
 });

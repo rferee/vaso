@@ -25,7 +25,7 @@ import {
 	OPENAI_REASONING_KEYS,
 	listOpenAIModels,
 	openAIChatBody,
-	parseOpenAIEmbeddings,
+	openAIEmbed,
 } from "./openai-compat";
 import type { ChatMessage, ChatStats, ChatStreamResult, LLMProvider, ModelInfo, StreamCallback } from "./types";
 
@@ -241,15 +241,8 @@ export const lmstudioProvider: LLMProvider = {
 		};
 	},
 
-	async embedBatch(ep, texts) {
-		if (texts.length === 0) return [];
-		getLogger().debug("embed", `LM Studio embed: ${texts.length} text(s), model=${ep.model}`);
-		const data = await requestJson(joinUrl(ep.url, "/v1/embeddings"), {
-			method: "POST",
-			body: { ...customParamsFlat(ep.customParams), model: ep.model, input: texts },
-			headers: buildHeaders(ep),
-		});
-		return parseOpenAIEmbeddings(data, texts.length, "LM Studio");
+	embedBatch(ep, texts) {
+		return openAIEmbed(joinUrl(ep.url, "/v1/embeddings"), ep, texts, buildHeaders(ep), "LM Studio");
 	},
 
 	async chatStream(ep, messages, cb, signal) {
