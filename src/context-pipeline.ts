@@ -108,6 +108,7 @@ export class ContextPipeline {
 		const chunks = index.chunks.filter((c) => isFileInScope(c.filePath, settings));
 		if (chunks.length === 0) return { run: { kind: "noMatches" }, inputKey };
 		const ep = await resolveEmbeddingEndpoint(settings);
+		opts.signal.throwIfAborted();
 		const mismatch = indexMismatch(index, settings, ep.model);
 		if (mismatch) {
 			return { run: { kind: "indexProblem", message: `${mismatch} Rebuild the index.` }, inputKey };
@@ -151,6 +152,7 @@ export class ContextPipeline {
 
 		const cacheKey = buildCacheKey(settings, vars);
 		const cached = this.cache.get(file.path, cacheKey);
+		opts.signal.throwIfAborted();
 		if (!opts.force && cached) {
 			return { run: { kind: "cached", response: cached, sources }, inputKey };
 		}

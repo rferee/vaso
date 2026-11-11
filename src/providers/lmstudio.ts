@@ -9,7 +9,7 @@
 
 import type { EndpointConfig } from "../types";
 import { getLogger } from "../logger";
-import { errorMessage } from "../errors";
+import { errorMessage, raceAbort } from "../errors";
 import {
 	buildHeaders,
 	consumeOpenAIStream,
@@ -247,7 +247,8 @@ export const lmstudioProvider: LLMProvider = {
 	async chatStream(ep, messages, cb, signal) {
 		const log = getLogger();
 		if (ep.contextSize) cb.onStatus("loading", "Checking model…");
-		await ensureModelLoaded(ep);
+		// Model loads can legitimately take minutes, so no timeout; Stop still works.
+		await raceAbort(ensureModelLoaded(ep), signal);
 
 		try {
 			const reader = await fetchStream(joinUrl(ep.url, "/api/v1/chat"), nativeChatBody(ep, messages), buildHeaders(ep), signal);

@@ -15,6 +15,7 @@ import type {
 import { toUnitVector } from "./vectors";
 import type { Vector } from "./vectors";
 import { getLogger } from "./logger";
+import { isTimeoutError, raceAbort, withTimeout } from "./errors";
 
 export type {
 	ChatMessage,
@@ -52,9 +53,17 @@ export function resolveEmbeddingEndpoint(settings: VasoSettings): Promise<Endpoi
 }
 
 /**
+ * A server that stops answering must not hold up the index queue forever.
+ * Slow hardware gets time in proportion to the text (about 60 tokens/s).
+ */
+const EMBED_TIMEOUT_MS = 120_000;
+const EMBED_TIMEOUT_MS_PER_CHAR = 4;
+
+/**
  * Embed texts with one endpoint and return unit vectors. A failed batch is
  * retried one text at a time; texts that still fail come back as null. Throws
- * when nothing could be embedded (the endpoint is down).
+ * when nothing could be embedded (the endpoint is down), when a request times
+ * out, and on abort.
  */
 export async function embedTexts(
 	ep: EndpointConfig,
@@ -64,6 +73,11 @@ export async function embedTexts(
 	if (texts.length === 0) return [];
 	signal?.throwIfAborted();
 	const provider = getProviderForEndpoint(ep);
+	// The provider requests can't be cancelled: on timeout or abort the late answer is dropped.
+	const embed = (batch: string[]) => {
+		const ms = EMBED_TIMEOUT_MS + batch.reduce((n, t) => n + t.length, 0) * EMBED_TIMEOUT_MS_PER_CHAR;
+		return raceAbort(withTimeout(provider.embedBatch(ep, batch), ms, "Embedding request"), signal);
+	};
 	// Only a non-empty array of finite numbers is a vector: an object with a huge
 	// `length` would hang the loop, and a base64 string would give NaNs.
 	const unit = (v: unknown) =>
@@ -72,10 +86,11 @@ export async function embedTexts(
 			: null;
 
 	try {
-		const vecs = await provider.embedBatch(ep, texts);
+		const vecs = await embed(texts);
 		return texts.map((_, i) => unit(vecs[i]));
 	} catch (err) {
-		if (texts.length === 1) throw err;
+		// Retrying text by text against a server that stopped answering would only stall longer.
+		if (texts.length === 1 || signal?.aborted || isTimeoutError(err)) throw err;
 		getLogger().warn("embed", `Batch of ${texts.length} failed, retrying one at a time`, err);
 	}
 
@@ -84,8 +99,9 @@ export async function embedTexts(
 	for (const text of texts) {
 		signal?.throwIfAborted();
 		try {
-			out.push(unit((await provider.embedBatch(ep, [text]))[0]));
+			out.push(unit((await embed([text]))[0]));
 		} catch (err) {
+			if (signal?.aborted || isTimeoutError(err)) throw err;
 			lastError = err;
 			out.push(null);
 		}

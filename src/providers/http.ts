@@ -1,7 +1,7 @@
 import { Platform, requestUrl } from "obsidian";
 import type * as NodeHttp from "http";
 import type { CustomParam, EndpointConfig } from "../types";
-import { abortError } from "../errors";
+import { abortError, raceAbort } from "../errors";
 import { getLogger } from "../logger";
 import { parseSSE, isSSEDone } from "./parse-sse";
 import type { ChatStats, ChatStreamResult, StreamCallback } from "./types";
@@ -182,12 +182,10 @@ async function bufferedStream(
 	headers: Record<string, string>,
 	signal?: AbortSignal,
 ): Promise<Reader> {
-	const request = requestUrl({ url, method: "POST", headers, body: JSON.stringify(body), throw: false });
-	const resp = await new Promise<Awaited<typeof request>>((resolve, reject) => {
-		const onAbort = () => reject(abortError(signal));
-		signal?.addEventListener("abort", onAbort, { once: true });
-		request.then(resolve, reject).finally(() => signal?.removeEventListener("abort", onAbort));
-	});
+	const resp = await raceAbort(
+		requestUrl({ url, method: "POST", headers, body: JSON.stringify(body), throw: false }),
+		signal,
+	);
 	if (resp.status >= 400) throw new HttpError(resp.status, resp.text);
 	const bytes = new Uint8Array(resp.arrayBuffer);
 	return new ReadableStream<Uint8Array>({
