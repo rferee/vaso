@@ -211,7 +211,11 @@ function extractCursorContext(
 
 	const offset = editor.posToOffset(editor.getCursor());
 	let idx = paragraphs.findIndex((p) => offset >= p.start && offset <= p.end);
-	if (idx === -1) idx = paragraphs.length - 1;
+	if (idx === -1) {
+		// Between paragraphs (a new one is being started): use the one before the cursor.
+		idx = 0;
+		for (let i = 0; i < paragraphs.length; i++) if (paragraphs[i]!.start <= offset) idx = i;
+	}
 
 	const fmEnd = settings.stripFrontmatter ? frontmatterLength(rawText) : 0;
 	const clean = (i: number): string => {
