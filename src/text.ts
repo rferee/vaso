@@ -96,7 +96,6 @@ export function lastWords(text: string, maxWords: number): string {
 // ── Paragraphs ───────────────────────────────────────────────────
 
 export interface Paragraph {
-	text: string;
 	start: number;
 	end: number;
 }
@@ -112,8 +111,7 @@ export function splitParagraphs(text: string): Paragraph[] {
 	let m: RegExpExecArray | null;
 
 	const push = (start: number, end: number) => {
-		const part = text.slice(start, end).trim();
-		if (part.length > 0) paragraphs.push({ text: part, start, end });
+		if (text.slice(start, end).trim().length > 0) paragraphs.push({ start, end });
 	};
 
 	while ((m = sepRe.exec(text)) !== null) {

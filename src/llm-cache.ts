@@ -33,10 +33,6 @@ export class LLMCache {
 		return this.pluginDir ? `${this.pluginDir}/${LLM_CACHE_FILE}` : LLM_CACHE_FILE;
 	}
 
-	get size(): number {
-		return this.entries.size;
-	}
-
 	/** Look up a cached response for a file. Returns the response if the cacheKey matches. */
 	get(filePath: string, cacheKey: string): string | null {
 		const entry = this.entries.get(filePath);

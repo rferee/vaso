@@ -45,11 +45,11 @@ export function parseOpenAIEmbeddings(data: unknown, expected: number, provider:
 
 export async function listOpenAIModels(url: string, ep: EndpointConfig): Promise<ModelEntry[]> {
 	const data = (await requestJson(url, { headers: buildHeaders(ep) })) as {
-		data?: Array<{ id?: string; owned_by?: string }>;
+		data?: Array<{ id?: string }>;
 	};
 	return (data?.data ?? [])
 		.filter((m) => m.id)
-		.map((m) => ({ id: m.id!, name: m.id!, ownedBy: m.owned_by }));
+		.map((m) => ({ id: m.id!, name: m.id! }));
 }
 
 export const openaiCompatProvider: LLMProvider = {

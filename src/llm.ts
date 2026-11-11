@@ -25,9 +25,6 @@ import { isAbortError, isTimeoutError, raceAbort, withTimeout } from "./errors";
 
 export type {
 	ChatMessage,
-	ChatStats,
-	ChatStreamResult,
-	StreamCallback,
 	StreamPhase,
 	ModelEntry,
 	ModelInfo,

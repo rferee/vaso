@@ -36,7 +36,6 @@ interface LMModel {
 	/** "llm", "embedding" or "decision". */
 	type?: string;
 	display_name?: string;
-	publisher?: string;
 	architecture?: string;
 	params_string?: string;
 	quantization?: { name?: string } | null;
@@ -157,7 +156,6 @@ async function consumeNativeStream(
 					stats = {
 						promptTokens: s.input_tokens,
 						responseTokens: typeof s.total_output_tokens === "number" ? s.total_output_tokens : 0,
-						totalDurationMs: 0,
 					};
 				}
 				if (!text) {
@@ -209,7 +207,6 @@ export const lmstudioProvider: LLMProvider = {
 				.map((m) => ({
 					id: m.key!,
 					name: m.display_name ?? m.key!,
-					ownedBy: m.publisher,
 					contextLength: positiveInt(m.max_context_length),
 					parameterSize: m.params_string,
 					kind: m.type === "embedding" ? ("embedding" as const) : ("llm" as const),

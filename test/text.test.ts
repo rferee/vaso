@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { frontmatterLength, inertMarkdown, stripFrontmatter } from "../src/text";
+import { frontmatterLength, inertMarkdown, splitParagraphs, stripFrontmatter } from "../src/text";
 
 const ZWSP = "\u200B";
 
@@ -20,6 +20,27 @@ describe("frontmatter", () => {
 		const note = "Intro\n\n---\n\nAfter the rule";
 		assert.equal(frontmatterLength(note), 0);
 		assert.equal(stripFrontmatter(note), note);
+	});
+});
+
+describe("splitParagraphs", () => {
+	test("paragraphs keep their offsets in the text", () => {
+		const text = "One\n\nTwo\r\n\r\nThree";
+		const paragraphs = splitParagraphs(text);
+		assert.deepEqual(paragraphs, [
+			{ start: 0, end: 3 },
+			{ start: 5, end: 8 },
+			{ start: 12, end: 17 },
+		]);
+		assert.deepEqual(
+			paragraphs.map((p) => text.slice(p.start, p.end)),
+			["One", "Two", "Three"],
+		);
+	});
+
+	test("blank and whitespace-only parts are no paragraphs", () => {
+		assert.deepEqual(splitParagraphs("\n\n  \n\nOne\n \t \n\n"), [{ start: 6, end: 9 }]);
+		assert.deepEqual(splitParagraphs(" \n\t"), []);
 	});
 });
 

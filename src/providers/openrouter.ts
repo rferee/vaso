@@ -44,7 +44,6 @@ export const openrouterProvider: LLMProvider = {
 		return (data?.data ?? []).map((m) => ({
 			id: m.id,
 			name: m.name ?? m.id,
-			ownedBy: m.id.includes("/") ? m.id.split("/")[0] : undefined,
 			contextLength: m.context_length,
 		}));
 	},

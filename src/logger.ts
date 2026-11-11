@@ -1,6 +1,5 @@
 import type { DataAdapter } from "obsidian";
 
-export type LogLevel = "error" | "warn" | "info" | "debug";
 export type LogCategory =
 	| "index"
 	| "embed"
@@ -140,7 +139,7 @@ export class DebugLogger {
 
 export type Logger = Pick<
 	DebugLogger,
-	"debug" | "info" | "warn" | "error" | "updateConfig" | "flush" | "destroy" | "debugEnabled"
+	"debug" | "info" | "warn" | "error" | "updateConfig" | "debugEnabled"
 >;
 
 let instance: DebugLogger | null = null;
@@ -158,8 +157,6 @@ const consoleFallback: Logger = {
 	warn: (_c, m, ...d) => console.warn(`[Vaso] ${m}`, ...d),
 	error: (_c, m, ...d) => console.error(`[Vaso] ${m}`, ...d),
 	updateConfig: () => undefined,
-	flush: () => Promise.resolve(),
-	destroy: () => Promise.resolve(),
 };
 
 export function getLogger(): Logger {

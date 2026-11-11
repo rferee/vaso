@@ -24,7 +24,6 @@ export interface ChatMessage {
 export interface ChatStats {
 	promptTokens: number;
 	responseTokens: number;
-	totalDurationMs: number;
 }
 
 export interface ChatStreamResult {
@@ -36,7 +35,6 @@ export interface ChatStreamResult {
 export interface ModelEntry {
 	id: string;
 	name: string;
-	ownedBy?: string;
 	contextLength?: number;
 	parameterSize?: string;
 	/** What the model is for, when the provider says. */

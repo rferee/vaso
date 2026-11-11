@@ -363,7 +363,6 @@ export async function consumeOpenAIStream(
 			stats = {
 				promptTokens: usage.prompt_tokens,
 				responseTokens: usage.completion_tokens ?? 0,
-				totalDurationMs: 0,
 			};
 		}
 	};

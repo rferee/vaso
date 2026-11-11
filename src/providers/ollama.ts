@@ -36,12 +36,7 @@ function parseStats(obj: Record<string, unknown>): ChatStats | null {
 	const prompt = obj.prompt_eval_count;
 	const resp = obj.eval_count;
 	if (typeof prompt !== "number" || typeof resp !== "number") return null;
-	const totalNs = obj.total_duration;
-	return {
-		promptTokens: prompt,
-		responseTokens: resp,
-		totalDurationMs: typeof totalNs === "number" ? Math.round(totalNs / 1e6) : 0,
-	};
+	return { promptTokens: prompt, responseTokens: resp };
 }
 
 /** NDJSON chat stream: one JSON object per line, the last one has `done: true`. */
@@ -109,7 +104,6 @@ export const ollamaProvider: LLMProvider = {
 		return (data?.models ?? []).map((m) => ({
 			id: m.model ?? m.name,
 			name: m.name,
-			ownedBy: m.details?.family,
 			parameterSize: m.details?.parameter_size,
 		}));
 	},
@@ -191,7 +185,7 @@ export const ollamaProvider: LLMProvider = {
 interface OllamaTagsModel {
 	name: string;
 	model?: string;
-	details?: { family?: string; parameter_size?: string };
+	details?: { parameter_size?: string };
 }
 
 interface OllamaShowResponse {
