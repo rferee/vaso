@@ -5,7 +5,7 @@
 
 // ── Cleaning ─────────────────────────────────────────────────────
 
-const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/;
+const FRONTMATTER_RE = /^---\r?\n(?:---|[\s\S]*?\r?\n---)(?:\r?\n|$)/;
 const CALLOUT_START_RE = /^>\s*\[!([^\]\s]+)\]/;
 
 export function stripFrontmatter(text: string): string {
