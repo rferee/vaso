@@ -154,7 +154,8 @@ export class IndexStore {
 	/** A file changed: queue an incremental update after the debounce. */
 	noteChanged(path: string): void {
 		const delay = this.getSettings().indexDebounceMs;
-		if (delay <= 0 || !this.index) return;
+		// No index yet: only the first build may have read the note already. The update runs after it.
+		if (delay <= 0 || (!this.index && !this.progress)) return;
 		this.pendingPaths.add(path);
 		if (this.updateTimer !== null) window.clearTimeout(this.updateTimer);
 		this.updateTimer = window.setTimeout(() => {
@@ -190,6 +191,8 @@ export class IndexStore {
 	private async sync(label: string, opts: SyncOptions, notify: boolean): Promise<void> {
 		// Queued before shutdown.
 		if (this.closed) return;
+		// Queued during a first build that failed: the next full update covers these files.
+		if (opts.paths && !this.index) return;
 		// Settings may change while a long sync runs; the vectors must match the ones it started with.
 		const settings = JSON.parse(JSON.stringify(this.getSettings())) as VasoSettings;
 		if (!hasIndexScope(settings)) {
