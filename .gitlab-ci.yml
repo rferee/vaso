@@ -18,6 +18,7 @@ build:
         if (pkg !== man) { console.error(`package.json ${pkg} != manifest.json ${man}`); process.exit(1); }
       '
     - npm ci
+    - npm test
     - npm run build
   artifacts:
     paths:

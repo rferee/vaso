@@ -125,6 +125,7 @@ Changing chunking or cleaning settings, or the embedding model, makes the index 
 npm install
 npm run dev        # watch build (esbuild, inline sourcemap)
 npm run build      # typecheck + production build (minified, no sourcemap)
+npm test           # unit tests (bundled with esbuild, run with node --test)
 ```
 
 ## Disclaimer
