@@ -81,3 +81,8 @@ export async function resolveEndpoint(
 export function clearResolveCache(): void {
 	resolveCache.clear();
 }
+
+/** Forget cached resolutions to `ep` (after a request to it failed), so the next request checks the list again. */
+export function forgetEndpoint(ep: EndpointConfig): void {
+	for (const [key, cached] of resolveCache) if (cached.ep.id === ep.id) resolveCache.delete(key);
+}

@@ -4,7 +4,13 @@
  */
 
 import type { EndpointConfig, VasoSettings } from "./types";
-import { resolveEndpoint, getProviderForEndpoint, clearResolveCache, checkEndpoint } from "./providers/registry";
+import {
+	resolveEndpoint,
+	getProviderForEndpoint,
+	clearResolveCache,
+	checkEndpoint,
+	forgetEndpoint,
+} from "./providers/registry";
 import type {
 	ChatMessage,
 	ChatStreamResult,
@@ -15,7 +21,7 @@ import type {
 import { toUnitVector } from "./vectors";
 import type { Vector } from "./vectors";
 import { getLogger } from "./logger";
-import { isTimeoutError, raceAbort, withTimeout } from "./errors";
+import { isAbortError, isTimeoutError, raceAbort, withTimeout } from "./errors";
 
 export type {
 	ChatMessage,
@@ -28,6 +34,20 @@ export type {
 } from "./providers/types";
 
 export { clearResolveCache, checkEndpoint };
+
+/**
+ * Run a request on a resolved endpoint. When it fails for any reason but an
+ * abort, the cached resolution is dropped: the next request checks the list
+ * again and can fail over instead of waiting out the cache.
+ */
+async function forgetOnFailure<T>(ep: EndpointConfig, signal: AbortSignal | undefined, request: () => Promise<T>): Promise<T> {
+	try {
+		return await request();
+	} catch (err) {
+		if (!signal?.aborted && !isAbortError(err)) forgetEndpoint(ep);
+		throw err;
+	}
+}
 
 // ── Model discovery ─────────────────────────────────────────────
 
@@ -65,7 +85,15 @@ const EMBED_TIMEOUT_MS_PER_CHAR = 4;
  * when nothing could be embedded (the endpoint is down), when a request times
  * out, and on abort.
  */
-export async function embedTexts(
+export function embedTexts(
+	ep: EndpointConfig,
+	texts: string[],
+	signal?: AbortSignal,
+): Promise<(Vector | null)[]> {
+	return forgetOnFailure(ep, signal, () => embedWithRetry(ep, texts, signal));
+}
+
+async function embedWithRetry(
 	ep: EndpointConfig,
 	texts: string[],
 	signal?: AbortSignal,
@@ -137,6 +165,6 @@ export async function chatStreamWithStatus(
 ): Promise<ChatStreamWithStatusResult> {
 	signal?.throwIfAborted();
 	const ep = await resolveEndpoint(settings.inferenceEndpoints, "infer");
-	const result = await getProviderForEndpoint(ep).chatStream(ep, messages, cb, signal);
+	const result = await forgetOnFailure(ep, signal, () => getProviderForEndpoint(ep).chatStream(ep, messages, cb, signal));
 	return { ...result, endpoint: ep };
 }
