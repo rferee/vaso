@@ -234,7 +234,9 @@ export class EndpointModal extends Modal {
 		const d = this.draft;
 		parent.empty();
 		if (!USES_CONTEXT.includes(d.providerType)) return;
-		const max = this.info?.contextLength ?? CONTEXT_FALLBACK_MAX;
+		const known = this.info?.contextLength;
+		// The options double up to `max`: it must be a sane positive integer.
+		const max = known !== undefined && Number.isSafeInteger(known) && known > 0 ? known : CONTEXT_FALLBACK_MAX;
 		const options: Record<string, string> = { "": "Model default" };
 		for (let v = 2048; v <= max; v *= 2) options[String(v)] = fmtTokens(v);
 		if (max % 1024 !== 0 || !options[String(max)]) options[String(max)] = `${fmtTokens(max)} (max)`;

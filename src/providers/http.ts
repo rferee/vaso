@@ -104,6 +104,11 @@ export async function requestJson(
 	return resp.json as unknown;
 }
 
+/** A count from a server response, such as a context length: a positive integer, else undefined (JSON reads 1e309 as Infinity). */
+export function positiveInt(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : undefined;
+}
+
 // ── Streaming ───────────────────────────────────────────────────
 
 type Reader = ReadableStreamDefaultReader<Uint8Array>;

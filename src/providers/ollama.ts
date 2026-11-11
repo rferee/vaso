@@ -1,6 +1,6 @@
 import type { EndpointConfig } from "../types";
 import { getLogger } from "../logger";
-import { buildHeaders, customParamsOllama, fetchStream, joinUrl, readText, requestJson } from "./http";
+import { buildHeaders, customParamsOllama, fetchStream, joinUrl, positiveInt, readText, requestJson } from "./http";
 import type {
 	ChatMessage,
 	ChatStats,
@@ -132,7 +132,8 @@ export const ollamaProvider: LLMProvider = {
 
 		let contextLength: number | undefined;
 		for (const [key, val] of Object.entries(data.model_info ?? {})) {
-			if (key.endsWith(".context_length") && typeof val === "number") contextLength = val;
+			const n = positiveInt(val);
+			if (key.endsWith(".context_length") && n !== undefined) contextLength = n;
 		}
 
 		return {

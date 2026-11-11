@@ -16,6 +16,7 @@ import {
 	customParamsFlat,
 	fetchStream,
 	joinUrl,
+	positiveInt,
 	readText,
 	requestJson,
 } from "./http";
@@ -198,7 +199,7 @@ export const lmstudioProvider: LLMProvider = {
 					id: m.key!,
 					name: m.display_name ?? m.key!,
 					ownedBy: m.publisher,
-					contextLength: m.max_context_length ?? undefined,
+					contextLength: positiveInt(m.max_context_length),
 					parameterSize: m.params_string,
 					kind: m.type === "embedding" ? ("embedding" as const) : ("llm" as const),
 				}));
@@ -225,7 +226,7 @@ export const lmstudioProvider: LLMProvider = {
 		return {
 			parameters: [],
 			capabilities: caps,
-			contextLength: m.max_context_length ?? undefined,
+			contextLength: positiveInt(m.max_context_length),
 			family: m.architecture,
 			parameterSize: m.params_string,
 			quantization: m.quantization?.name,

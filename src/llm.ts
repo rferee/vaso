@@ -64,7 +64,12 @@ export async function embedTexts(
 	if (texts.length === 0) return [];
 	signal?.throwIfAborted();
 	const provider = getProviderForEndpoint(ep);
-	const unit = (v: number[] | undefined) => (v && v.length > 0 ? toUnitVector(v) : null);
+	// Only a non-empty array of finite numbers is a vector: an object with a huge
+	// `length` would hang the loop, and a base64 string would give NaNs.
+	const unit = (v: unknown) =>
+		Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === "number" && Number.isFinite(x))
+			? toUnitVector(v)
+			: null;
 
 	try {
 		const vecs = await provider.embedBatch(ep, texts);
